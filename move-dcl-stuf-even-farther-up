@@ -1,0 +1,54 @@
+diff --git a/console.h b/console.h
+index 6eb25e6..00d7078 100644
+--- a/console.h
++++ b/console.h
+@@ -154,6 +154,21 @@ void cursor_get_mono_mask(QEMUCursor *c, int transparent, uint8_t *mask);
+ 
+ extern pthread_mutex_t cursor_mutex;
+ 
++#ifdef CONFIG_CURSES
++#include <curses.h>
++typedef chtype console_ch_t;
++#else
++typedef unsigned long console_ch_t;
++#endif
++
++typedef void (*vga_hw_update_ptr)(void *);
++typedef void (*vga_hw_invalidate_ptr)(void *);
++typedef void (*vga_hw_screen_dump_ptr)(void *, const char *, bool cswitch,
++                                       Error **errp);
++typedef void (*vga_hw_text_update_ptr)(void *, console_ch_t *);
++typedef DisplayState * (*vga_hw_add_display_ptr)(void *);
++typedef void (*display_hw_thumbnail_dump_ptr)(void *, const char *);
++
+ struct DisplayChangeListener {
+     int idle;
+     uint64_t gui_timer_interval;
+@@ -196,27 +211,6 @@ struct DisplayChangeListener {
+     QLIST_ENTRY(DisplayChangeListener) next;
+ };
+ 
+-#ifdef CONFIG_CURSES
+-#include <curses.h>
+-typedef chtype console_ch_t;
+-#else
+-typedef unsigned long console_ch_t;
+-#endif
+-static inline void console_write_ch(console_ch_t *dest, uint32_t ch)
+-{
+-    if (!(ch & 0xff))
+-        ch |= ' ';
+-    *dest = ch;
+-}
+-
+-typedef void (*vga_hw_update_ptr)(void *);
+-typedef void (*vga_hw_invalidate_ptr)(void *);
+-typedef void (*vga_hw_screen_dump_ptr)(void *, const char *, bool cswitch,
+-                                       Error **errp);
+-typedef void (*vga_hw_text_update_ptr)(void *, console_ch_t *);
+-typedef DisplayState * (*vga_hw_add_display_ptr)(void *);
+-typedef void (*display_hw_thumbnail_dump_ptr)(void *, const char *);
+-
+ struct DisplayState {
+     struct DisplaySurface *surface;
+     DisplayType display_type;

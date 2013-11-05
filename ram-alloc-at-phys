@@ -1,0 +1,112 @@
+diff --git a/exec.c b/exec.c
+index 6765556..d706f4b 100644
+--- a/exec.c
++++ b/exec.c
+@@ -2542,6 +2542,66 @@ static int memory_try_enable_merging(void *addr, size_t len)
+     return qemu_madvise(addr, len, QEMU_MADV_MERGEABLE);
+ }
+ 
++ram_addr_t qemu_ram_alloc_at_phys(ram_addr_t size, ram_addr_t addr,
++                                  MemoryRegion *mr)
++{
++    RAMBlock *new_block;
++
++    size = TARGET_PAGE_ALIGN(size);
++    new_block = g_malloc0(sizeof(*new_block));
++
++    new_block->mr = mr;
++    new_block->offset = addr & TARGET_PAGE_MASK;
++    if (mem_path) {
++#if defined (__linux__) && !defined(TARGET_S390X)
++        new_block->host = file_ram_alloc(new_block, size, mem_path);
++        if (!new_block->host) {
++            new_block->host = qemu_vmalloc(size);
++            qemu_madvise(new_block->host, size, QEMU_MADV_MERGEABLE);
++        }
++#else
++        fprintf(stderr, "-mem-path option unsupported\n");
++        exit(1);
++#endif
++    } else {
++#if defined(TARGET_S390X) && defined(CONFIG_KVM)
++        /* S390 KVM requires the topmost vma of the RAM to be smaller than
++           an system defined value, which is at least 256GB. Larger systems
++           have larger values. We put the guest between the end of data
++           segment (system break) and this value. We use 32GB as a base to
++           have enough room for the system break to grow. */
++        new_block->host = mmap((void*)0x800000000, size,
++                               PROT_EXEC|PROT_READ|PROT_WRITE,
++                               MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++        if (new_block->host == MAP_FAILED) {
++            fprintf(stderr, "Allocating RAM failed\n");
++            abort();
++        }
++#else
++        if (xen_enabled()) {
++            xen_ram_alloc(new_block->offset, size, mr);
++            new_block->host = xen_map_memory(new_block->offset, size);
++        } else {
++            new_block->host = qemu_vmalloc(size);
++        }
++#endif
++        qemu_madvise(new_block->host, size, QEMU_MADV_MERGEABLE);
++    }
++    new_block->length = size;
++
++    QLIST_INSERT_HEAD(&ram_list.blocks, new_block, next);
++
++    ram_list.phys_dirty = g_realloc(ram_list.phys_dirty,
++                                       last_ram_offset() >> TARGET_PAGE_BITS);
++    memset(ram_list.phys_dirty + (new_block->offset >> TARGET_PAGE_BITS),
++           0xff, size >> TARGET_PAGE_BITS);
++
++    if (kvm_enabled())
++        kvm_setup_guest_memory(new_block->host, size);
++
++    return new_block->offset;
++}
++
+ ram_addr_t qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
+                                    MemoryRegion *mr)
+ {
+diff --git a/memory.c b/memory.c
+index 7419853..0cdfaa8 100644
+--- a/memory.c
++++ b/memory.c
+@@ -956,6 +956,19 @@ void memory_region_init_ram_ptr(MemoryRegion *mr,
+     mr->ram_addr = qemu_ram_alloc_from_ptr(size, ptr, mr);
+ }
+ 
++void memory_region_init_ram_phys(MemoryRegion *mr,
++                                DeviceState *dev,
++                                const char *name,
++                                uint64_t size,
++                                ram_addr_t ptr)
++{
++    memory_region_init(mr, name, size);
++    mr->terminates = true;
++    mr->destructor = memory_region_destructor_ram;
++    mr->ram_addr = qemu_ram_alloc_at_phys(size, ptr, mr);
++    mr->ram = true;
++}
++
+ void memory_region_init_alias(MemoryRegion *mr,
+                               const char *name,
+                               MemoryRegion *orig,
+diff --git a/memory.h b/memory.h
+index 9462bfd..5bc9b80 100644
+--- a/memory.h
++++ b/memory.h
+@@ -287,6 +287,12 @@ void memory_region_init_ram_ptr(MemoryRegion *mr,
+                                 uint64_t size,
+                                 void *ptr);
+ 
++void memory_region_init_ram_phys(MemoryRegion *mr,
++                                DeviceState *dev,
++                                const char *name,
++                                uint64_t size,
++                                ram_addr_t ptr);
++
+ /**
+  * memory_region_init_alias: Initialize a memory region that aliases all or a
+  *                           part of another memory region.

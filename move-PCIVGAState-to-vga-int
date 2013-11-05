@@ -1,0 +1,48 @@
+diff --git a/hw/vga-pci.c b/hw/vga-pci.c
+index 947e35c..2db0a73 100644
+--- a/hw/vga-pci.c
++++ b/hw/vga-pci.c
+@@ -41,15 +41,6 @@ enum vga_pci_flags {
+     PCI_VGA_FLAG_ENABLE_MMIO = 1,
+ };
+ 
+-typedef struct PCIVGAState {
+-    PCIDevice dev;
+-    VGACommonState vga;
+-    uint32_t flags;
+-    MemoryRegion mmio;
+-    MemoryRegion ioport;
+-    MemoryRegion bochs;
+-} PCIVGAState;
+-
+ static const VMStateDescription vmstate_vga_pci = {
+     .name = "vga",
+     .version_id = 2,
+diff --git a/hw/vga_int.h b/hw/vga_int.h
+index 12c229a..df81933 100644
+--- a/hw/vga_int.h
++++ b/hw/vga_int.h
+@@ -26,6 +26,7 @@
+ #include "error.h"
+ #include "memory.h"
+ #include <console.h>
++#include "pci.h"
+ 
+ #define ST01_V_RETRACE      0x08
+ #define ST01_DISP_ENABLE    0x01
+@@ -171,6 +172,15 @@ typedef struct VGACommonState {
+     uint8_t is_vbe_vmstate;
+ } VGACommonState;
+ 
++typedef struct PCIVGAState {
++    PCIDevice dev;
++    VGACommonState vga;
++    uint32_t flags;
++    MemoryRegion mmio;
++    MemoryRegion ioport;
++    MemoryRegion bochs;
++} PCIVGAState;
++
+ static inline int c6_to_8(int v)
+ {
+     int b;

@@ -1,0 +1,92 @@
+diff --git a/vl.c b/vl.c
+index a3ab384..9ee9f4b 100644
+--- a/vl.c
++++ b/vl.c
+@@ -2524,6 +2524,42 @@ static int object_create(QemuOpts *opts, void *opaque)
+     return 0;
+ }
+ 
++static int main_spin = 0;
++
++static void main_wait(const char *fname)
++{
++	int fd = open(fname, O_RDONLY);
++
++	/* We've got a debug file, warn the user and spin */
++        if (fd >= 0) {
++                main_spin = 1;
++		qemu_log("#########################################\n");
++		qemu_log("#            WARNING!\n");
++		qemu_log("# %s exists:\n", fname);
++		qemu_log("# We're waiting for the variable\n");
++		qemu_log("# main_spin to go zero, or for\n");
++		qemu_log("# /etc/orc/main_spin to be deleted\n");
++		qemu_log("#########################################\n");
++                close(fd);
++	}
++
++	/* If needed, wait for something to change */
++        while (main_spin) {
++
++		/* Wait a while */
++		sleep(1);
++
++		/* Try to open the file again */
++		fd = open(fname, O_RDONLY);
++
++		/* See if the file still exists */
++                if (fd >= 0)
++			close(fd);
++		else
++			main_spin = 0;
++	}
++}
++
+ int main(int argc, char **argv, char **envp)
+ {
+     int i;
+@@ -2559,6 +2595,8 @@ int main(int argc, char **argv, char **envp)
+     const char *trace_events = NULL;
+     const char *trace_file = NULL;
+ 
++    main_wait("/etc/orc/main_spin_early");
++
+     atexit(qemu_run_exit_notifiers);
+     error_set_progname(argv[0]);
+ 
+@@ -2602,6 +2640,17 @@ int main(int argc, char **argv, char **envp)
+ 
+     autostart= 1;
+ 
++    /*
++     * If the file "/etc/orc/main_spin" exists, we'll wait
++     * until the global variable main_spin is set to 0.
++     * This allows us to let qemu start up normally, but
++     * not get too far in its processing.  Once it's in
++     * this state we can attach with a debugger, set the
++     * value to zero, set any breakpoints, etc., and
++     * continue.
++     */
++    main_wait("/etc/orc/main_spin");
++
+     /* first pass of option parsing */
+     optind = 1;
+     while (optind < argc) {
+@@ -3995,6 +4044,17 @@ int main(int argc, char **argv, char **envp)
+ 
+     os_setup_post();
+ 
++    /*
++     * If the file "/etc/orc/main_spin_late" exists, we'll
++     * wait until the global variable main_spin is set to 0.
++     * This allows us to let qemu start up normally, but
++     * not get too far in its processing.  Once it's in
++     * this state we can attach with a debugger, set the
++     * value to zero, set any breakpoints, etc., and
++     * continue.
++     */
++    main_wait("/etc/orc/main_spin_late");
++
+     resume_all_vcpus();
+     main_loop();
+     bdrv_close_all();

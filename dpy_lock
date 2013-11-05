@@ -1,0 +1,42 @@
+diff --git a/console.h b/console.h
+index 0b28105..405aef1 100644
+--- a/console.h
++++ b/console.h
+@@ -164,9 +164,14 @@ struct DisplayChangeListener {
+     void (*dpy_text_resize)(struct DisplayState *s, int w, int h);
+     void (*dpy_text_update)(struct DisplayState *s, int x, int y, int w, int h);
+ 
++    void (*dpy_lock)(struct DisplayState *s);
++    void (*dpy_unlock)(struct DisplayState *s);
++
+     void (*dpy_mouse_set)(struct DisplayState *s, int x, int y, int on);
+     void (*dpy_cursor_define)(struct DisplayState *s, QEMUCursor *cursor);
+ 
++    
++
+     QLIST_ENTRY(DisplayChangeListener) next;
+ };
+ 
+@@ -340,6 +345,22 @@ static inline bool dpy_cursor_define_supported(struct DisplayState *s)
+     return false;
+ }
+ 
++static inline void dpy_lock(struct DisplayState *s) {
++    struct DisplayChangeListener *dcl = s->listeners;
++    while (dcl != NULL) {
++        if (dcl->dpy_lock) dcl->dpy_lock(s);
++        dcl = dcl->next;
++    }
++}
++
++static inline void dpy_unlock(struct DisplayState *s) {
++    struct DisplayChangeListener *dcl = s->listeners;
++    while (dcl != NULL) {
++        if (dcl->dpy_unlock) dcl->dpy_unlock(s);
++        dcl = dcl->next;
++    }
++}
++
+ static inline int ds_get_linesize(DisplayState *ds)
+ {
+     return pixman_image_get_stride(ds->surface->image);

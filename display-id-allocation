@@ -1,0 +1,66 @@
+diff --git a/console.c b/console.c
+index eafbd1f..1908233 100644
+--- a/console.c
++++ b/console.c
+@@ -1408,12 +1408,31 @@ static void dumb_display_init(void)
+ /***********************************************************/
+ /* register display */
+ 
++static int allocate_display_id(void)
++{
++    uint64_t map = 0;
++    DisplayState *ds;
++
++    if (!display_state) {
++        return 0;
++    }
++
++    ds = get_displaystate();
++
++    for (; ds; ds = ds->next) {
++	map |= (1 << ds->display_id);
++    }
++
++    return ffs(~map) - 1;
++}
++
+ void register_displaystate(DisplayState *ds)
+ {
+     DisplayState **s;
+     s = &display_state;
+     while (*s != NULL)
+         s = &(*s)->next;
++    ds->display_id = allocate_display_id();
+     ds->next = NULL;
+     *s = ds;
+ }
+diff --git a/console.h b/console.h
+index c2267e3..35aac4b 100644
+--- a/console.h
++++ b/console.h
+@@ -209,6 +209,7 @@ typedef void (*vga_hw_invalidate_ptr)(void *);
+ typedef void (*vga_hw_screen_dump_ptr)(void *, const char *,
+                                        Error **errp);
+ typedef void (*vga_hw_text_update_ptr)(void *, console_ch_t *);
++typedef DisplayState * (*vga_hw_add_display_ptr)(void *);
+ typedef void (*display_hw_thumbnail_dump_ptr)(void *, const char *);
+ 
+ struct DisplayState {
+@@ -248,7 +249,8 @@ static inline int is_surface_bgr(DisplaySurface *surface)
+ 
+ static inline int is_buffer_shared(DisplaySurface *surface)
+ {
+-    return !(surface->flags & QEMU_ALLOCATED_FLAG);
++    return (!(surface->flags & QEMU_ALLOCATED_FLAG) &&
++            !(surface->flags & QEMU_SHM_FLAG));
+ }
+ 
+ void gui_setup_refresh(DisplayState *ds);
+@@ -483,6 +485,7 @@ DisplayState *graphic_console_init(vga_hw_update_ptr update,
+ void vga_hw_update(void);
+ void vga_hw_invalidate(void);
+ void vga_hw_text_update(console_ch_t *chardata);
++DisplayState *vga_hw_add_display(void);
+ 
+ /* Multi-display, framebuffer only versions of the above vga_hw functions */
+ void display_hw_update(DisplayState *ds);

@@ -1,0 +1,247 @@
+diff --git a/exec.c b/exec.c
+index 6765556..d706f4b 100644
+--- a/exec.c
++++ b/exec.c
+@@ -2542,6 +2542,66 @@ static int memory_try_enable_merging(void *addr, size_t len)
+     return qemu_madvise(addr, len, QEMU_MADV_MERGEABLE);
+ }
+ 
++ram_addr_t qemu_ram_alloc_at_phys(ram_addr_t size, ram_addr_t addr,
++                                  MemoryRegion *mr)
++{
++    RAMBlock *new_block;
++
++    size = TARGET_PAGE_ALIGN(size);
++    new_block = g_malloc0(sizeof(*new_block));
++
++    new_block->mr = mr;
++    new_block->offset = addr & TARGET_PAGE_MASK;
++    if (mem_path) {
++#if defined (__linux__) && !defined(TARGET_S390X)
++        new_block->host = file_ram_alloc(new_block, size, mem_path);
++        if (!new_block->host) {
++            new_block->host = qemu_vmalloc(size);
++            qemu_madvise(new_block->host, size, QEMU_MADV_MERGEABLE);
++        }
++#else
++        fprintf(stderr, "-mem-path option unsupported\n");
++        exit(1);
++#endif
++    } else {
++#if defined(TARGET_S390X) && defined(CONFIG_KVM)
++        /* S390 KVM requires the topmost vma of the RAM to be smaller than
++           an system defined value, which is at least 256GB. Larger systems
++           have larger values. We put the guest between the end of data
++           segment (system break) and this value. We use 32GB as a base to
++           have enough room for the system break to grow. */
++        new_block->host = mmap((void*)0x800000000, size,
++                               PROT_EXEC|PROT_READ|PROT_WRITE,
++                               MAP_SHARED | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
++        if (new_block->host == MAP_FAILED) {
++            fprintf(stderr, "Allocating RAM failed\n");
++            abort();
++        }
++#else
++        if (xen_enabled()) {
++            xen_ram_alloc(new_block->offset, size, mr);
++            new_block->host = xen_map_memory(new_block->offset, size);
++        } else {
++            new_block->host = qemu_vmalloc(size);
++        }
++#endif
++        qemu_madvise(new_block->host, size, QEMU_MADV_MERGEABLE);
++    }
++    new_block->length = size;
++
++    QLIST_INSERT_HEAD(&ram_list.blocks, new_block, next);
++
++    ram_list.phys_dirty = g_realloc(ram_list.phys_dirty,
++                                       last_ram_offset() >> TARGET_PAGE_BITS);
++    memset(ram_list.phys_dirty + (new_block->offset >> TARGET_PAGE_BITS),
++           0xff, size >> TARGET_PAGE_BITS);
++
++    if (kvm_enabled())
++        kvm_setup_guest_memory(new_block->host, size);
++
++    return new_block->offset;
++}
++
+ ram_addr_t qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
+                                    MemoryRegion *mr)
+ {
+diff --git a/hw/vga.c b/hw/vga.c
+index 2b0200a..a8b79b0 100644
+--- a/hw/vga.c
++++ b/hw/vga.c
+@@ -2285,7 +2285,6 @@ void vga_common_init(VGACommonState *s)
+     s->is_vbe_vmstate = 1;
+     memory_region_init_ram(&s->vram, "vga.vram", s->vram_size);
+     vmstate_register_ram_global(&s->vram);
+-    xen_register_framebuffer(&s->vram);
+     s->vram_ptr = memory_region_get_ram_ptr(&s->vram);
+     s->get_bpp = vga_get_bpp;
+     s->get_offsets = vga_get_offsets;
+diff --git a/hw/xen.h b/hw/xen.h
+index f78fe79..9524ed4 100644
+--- a/hw/xen.h
++++ b/hw/xen.h
+@@ -53,9 +53,6 @@ void xen_ram_free(ram_addr_t ram_addr, ram_addr_t size);
+ void xen_modified_memory(ram_addr_t start, ram_addr_t length);
+ #endif
+ 
+-struct MemoryRegion;
+-void xen_register_framebuffer(struct MemoryRegion *mr);
+-
+ #if defined(CONFIG_XEN) && CONFIG_XEN_CTRL_INTERFACE_VERSION < 400
+ #  define HVM_MAX_VCPUS 32
+ #endif
+diff --git a/memory.c b/memory.c
+index 7419853..0cdfaa8 100644
+--- a/memory.c
++++ b/memory.c
+@@ -956,6 +956,19 @@ void memory_region_init_ram_ptr(MemoryRegion *mr,
+     mr->ram_addr = qemu_ram_alloc_from_ptr(size, ptr, mr);
+ }
+ 
++void memory_region_init_ram_phys(MemoryRegion *mr,
++                                DeviceState *dev,
++                                const char *name,
++                                uint64_t size,
++                                ram_addr_t ptr)
++{
++    memory_region_init(mr, name, size);
++    mr->terminates = true;
++    mr->destructor = memory_region_destructor_ram;
++    mr->ram_addr = qemu_ram_alloc_at_phys(size, ptr, mr);
++    mr->ram = true;
++}
++
+ void memory_region_init_alias(MemoryRegion *mr,
+                               const char *name,
+                               MemoryRegion *orig,
+diff --git a/memory.h b/memory.h
+index 9462bfd..5bc9b80 100644
+--- a/memory.h
++++ b/memory.h
+@@ -287,6 +287,12 @@ void memory_region_init_ram_ptr(MemoryRegion *mr,
+                                 uint64_t size,
+                                 void *ptr);
+ 
++void memory_region_init_ram_phys(MemoryRegion *mr,
++                                DeviceState *dev,
++                                const char *name,
++                                uint64_t size,
++                                ram_addr_t ptr);
++
+ /**
+  * memory_region_init_alias: Initialize a memory region that aliases all or a
+  *                           part of another memory region.
+diff --git a/xen-all.c b/xen-all.c
+index 9b53751..8a54d59 100644
+--- a/xen-all.c
++++ b/xen-all.c
+@@ -37,9 +37,10 @@
+ #endif
+ 
+ static MemoryRegion ram_memory, ram_640k, ram_lo, ram_hi;
+-static MemoryRegion *framebuffer;
+ static bool xen_in_migration;
+ 
++#define USE_DIRTY_PAGE_TRACKING
++
+ /* Compatibility with older version */
+ #if __XEN_LATEST_INTERFACE_VERSION__ < 0x0003020a
+ static inline uint32_t xen_vcpu_eport(shared_iopage_t *shared_page, int i)
+@@ -310,16 +311,6 @@ static int xen_add_to_physmap(XenIOState *state,
+         return -1;
+     }
+ 
+-    /* Xen can only handle a single dirty log region for now and we want
+-     * the linear framebuffer to be that region.
+-     * Avoid tracking any regions that is not videoram and avoid tracking
+-     * the legacy vga region. */
+-    if (mr == framebuffer && start_addr > 0xbffff) {
+-        goto go_physmap;
+-    }
+-    return -1;
+-
+-go_physmap:
+     DPRINTF("mapping vram to %llx - %llx\n", start_addr, start_addr + size);
+ 
+     pfn = phys_offset >> TARGET_PAGE_BITS;
+@@ -502,20 +493,6 @@ static void xen_sync_dirty_bitmap(XenIOState *state,
+     const int width = sizeof(unsigned long) * 8;
+     unsigned long bitmap[(npages + width - 1) / width];
+     int rc, i, j;
+-    const XenPhysmap *physmap = NULL;
+-
+-    physmap = get_physmapping(state, start_addr, size);
+-    if (physmap == NULL) {
+-        /* not handled */
+-        return;
+-    }
+-
+-    if (state->log_for_dirtybit == NULL) {
+-        state->log_for_dirtybit = physmap;
+-    } else if (state->log_for_dirtybit != physmap) {
+-        /* Only one range for dirty bitmap can be tracked. */
+-        return;
+-    }
+ 
+     rc = xc_hvm_track_dirty_vram(xen_xc, xen_domid,
+                                  start_addr >> TARGET_PAGE_BITS, npages,
+@@ -532,13 +509,12 @@ static void xen_sync_dirty_bitmap(XenIOState *state,
+ 
+     for (i = 0; i < ARRAY_SIZE(bitmap); i++) {
+         unsigned long map = bitmap[i];
+-        while (map != 0) {
+-            j = ffsl(map) - 1;
+-            map &= ~(1ul << j);
+-            memory_region_set_dirty(framebuffer,
+-                                    (i * width + j) * TARGET_PAGE_SIZE,
+-                                    TARGET_PAGE_SIZE);
+-        };
++        for (j = i * width; map && j < npages; map >>= 1, j++) {
++            if (map & 1)
++                    memory_region_set_dirty(&ram_memory,
++                                            start_addr + (j * XC_PAGE_SIZE),
++                                            XC_PAGE_SIZE);
++        }
+     }
+ }
+ 
+@@ -1000,7 +976,6 @@ static void xen_main_loop_prepare(XenIOState *state)
+     }
+ }
+ 
+-
+ /* Initialise Xen */
+ 
+ static void xen_change_state_handler(void *opaque, int running,
+@@ -1206,11 +1181,6 @@ void destroy_hvm_domain(bool reboot)
+     }
+ }
+ 
+-void xen_register_framebuffer(MemoryRegion *mr)
+-{
+-    framebuffer = mr;
+-}
+-
+ void xen_shutdown_fatal_error(const char *fmt, ...)
+ {
+     va_list ap;
+diff --git a/xen-stub.c b/xen-stub.c
+index 9214392..24cbc98 100644
+--- a/xen-stub.c
++++ b/xen-stub.c
+@@ -52,10 +52,6 @@ int xen_init(void)
+     return -ENOSYS;
+ }
+ 
+-void xen_register_framebuffer(MemoryRegion *mr)
+-{
+-}
+-
+ void qmp_xen_set_global_dirty_log(bool enable, Error **errp)
+ {
+ }

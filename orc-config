@@ -1,0 +1,100 @@
+diff --git a/Makefile b/Makefile
+index 9ecbcbb..43907eb 100644
+--- a/Makefile
++++ b/Makefile
+@@ -49,6 +49,7 @@ configure: ;
+ $(call set-vpath, $(SRC_PATH))
+ 
+ LIBS+=-lz $(LIBS_TOOLS)
++LIBS+=-lorccomm
+ 
+ HELPERS-$(CONFIG_LINUX) = qemu-bridge-helper$(EXESUF)
+ 
+diff --git a/arch_init.c b/arch_init.c
+index e6effe8..498e209 100644
+--- a/arch_init.c
++++ b/arch_init.c
+@@ -902,7 +902,7 @@ struct soundhw {
+ 
+ static struct soundhw soundhw[] = {
+ #ifdef HAS_AUDIO_CHOICE
+-#ifdef CONFIG_PCSPK
++#ifdef CONFIG_PCSPK && !defined(CONFIG_XEN)
+     {
+         "pcspk",
+         "PC speaker",
+diff --git a/default-configs/x86_64-softmmu.mak b/default-configs/x86_64-softmmu.mak
+index 233a856..d22000b 100644
+--- a/default-configs/x86_64-softmmu.mak
++++ b/default-configs/x86_64-softmmu.mak
+@@ -9,10 +9,10 @@ CONFIG_VMWARE_VGA=y
+ CONFIG_VMMOUSE=y
+ CONFIG_SERIAL=y
+ CONFIG_PARALLEL=y
+-CONFIG_I8254=y
+-CONFIG_PCSPK=y
++CONFIG_I8254=n
++CONFIG_PCSPK=n
+ CONFIG_PCKBD=y
+-CONFIG_FDC=y
++CONFIG_FDC=n
+ CONFIG_ACPI=y
+ CONFIG_APM=y
+ CONFIG_DMA=y
+@@ -21,7 +21,7 @@ CONFIG_IDE_PIIX=y
+ CONFIG_NE2000_ISA=y
+ CONFIG_PIIX_PCI=y
+ CONFIG_SOUND=y
+-CONFIG_HPET=y
++CONFIG_HPET=n
+ CONFIG_APPLESMC=y
+ CONFIG_I8259=y
+ CONFIG_PFLASH_CFI01=y
+diff --git a/exec.c b/exec.c
+index d706f4b..c90c7d0 100644
+--- a/exec.c
++++ b/exec.c
+@@ -522,6 +522,9 @@ bool memory_region_is_unassigned(MemoryRegion *mr)
+ 
+ static inline size_t size_code_gen_buffer(size_t tb_size)
+ {
++    if (xen_enabled())
++        return MIN_CODE_GEN_BUFFER_SIZE;
++
+     /* Size the buffer.  */
+     if (tb_size == 0) {
+ #ifdef USE_STATIC_CODE_GEN_BUFFER
+diff --git a/hw/pc.c b/hw/pc.c
+index 2b5bbbf..4ee39b3 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -979,7 +979,7 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
+     qemu_irq pit_alt_irq = NULL;
+     qemu_irq rtc_irq = NULL;
+     qemu_irq *a20_line;
+-    ISADevice *i8042, *port92, *vmmouse, *pit = NULL;
++    ISADevice *i8042, *port92, *vmmouse, *pit;
+     qemu_irq *cpu_exit_irq;
+ 
+     register_ioport_write(0x80, 1, 1, ioport80_write, NULL);
+diff --git a/vl.c b/vl.c
+index 89f8942..bd1966e 100644
+--- a/vl.c
++++ b/vl.c
+@@ -272,12 +272,12 @@ enum xen_mode xen_mode = XEN_EMULATE;
+ static int tcg_tb_size;
+ 
+ static int default_serial = 1;
+-static int default_parallel = 1;
+-static int default_virtcon = 1;
++static int default_parallel = 0;
++static int default_virtcon = 0;
+ static int default_monitor = 1;
+-static int default_floppy = 1;
++static int default_floppy = 0;
+ static int default_cdrom = 1;
+-static int default_sdcard = 1;
++static int default_sdcard = 0;
+ static int default_vga = 1;
+ 
+ #include <syslog.h>

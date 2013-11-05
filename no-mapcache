@@ -1,0 +1,219 @@
+diff --git a/cpu-common.h b/cpu-common.h
+index d2fbafa..eee1435 100644
+--- a/cpu-common.h
++++ b/cpu-common.h
+@@ -37,6 +37,10 @@ typedef void CPUWriteMemoryFunc(void *opaque, hwaddr addr, uint32_t value);
+ typedef uint32_t CPUReadMemoryFunc(void *opaque, hwaddr addr);
+ 
+ void qemu_ram_remap(ram_addr_t addr, ram_addr_t length);
++#ifdef CONFIG_XEN
++uint8_t *xen_map_memory(target_phys_addr_t addr, target_phys_addr_t size);
++#endif
++
+ /* This should only be used for ram local to a device.  */
+ void *qemu_get_ram_ptr(ram_addr_t addr);
+ void qemu_put_ram_ptr(void *addr);
+diff --git a/exec.c b/exec.c
+index 51f51cf..6765556 100644
+--- a/exec.c
++++ b/exec.c
+@@ -54,7 +54,6 @@
+ #endif
+ #endif
+ #else /* !CONFIG_USER_ONLY */
+-#include "xen-mapcache.h"
+ #include "trace.h"
+ #endif
+ 
+@@ -2571,6 +2570,7 @@ ram_addr_t qemu_ram_alloc_from_ptr(ram_addr_t size, void *host,
+         } else {
+             if (xen_enabled()) {
+                 xen_ram_alloc(new_block->offset, size, mr);
++                new_block->host = xen_map_memory(new_block->offset, size);
+             } else if (kvm_enabled()) {
+                 /* some s390/kvm configurations have special constraints */
+                 new_block->host = kvm_vmalloc(size);
+@@ -2642,7 +2642,8 @@ void qemu_ram_free(ram_addr_t addr)
+                 munmap(block->host, block->length);
+ #else
+                 if (xen_enabled()) {
+-                    xen_invalidate_map_cache_entry(block->host);
++                    xen_ram_free(addr, block->length);
++                    munmap(block->host, block->length);
+                 } else {
+                     qemu_vfree(block->host);
+                 }
+@@ -2736,18 +2737,6 @@ void *qemu_get_ram_ptr(ram_addr_t addr)
+                 QLIST_REMOVE(block, next);
+                 QLIST_INSERT_HEAD(&ram_list.blocks, block, next);
+             }
+-            if (xen_enabled()) {
+-                /* We need to check if the requested address is in the RAM
+-                 * because we don't want to map the entire memory in QEMU.
+-                 * In that case just map until the end of the page.
+-                 */
+-                if (block->offset == 0) {
+-                    return xen_map_cache(addr, 0, 0);
+-                } else if (block->host == NULL) {
+-                    block->host =
+-                        xen_map_cache(block->offset, block->length, 1);
+-                }
+-            }
+             return block->host + (addr - block->offset);
+         }
+     }
+@@ -2767,18 +2756,6 @@ static void *qemu_safe_ram_ptr(ram_addr_t addr)
+ 
+     QLIST_FOREACH(block, &ram_list.blocks, next) {
+         if (addr - block->offset < block->length) {
+-            if (xen_enabled()) {
+-                /* We need to check if the requested address is in the RAM
+-                 * because we don't want to map the entire memory in QEMU.
+-                 * In that case just map until the end of the page.
+-                 */
+-                if (block->offset == 0) {
+-                    return xen_map_cache(addr, 0, 0);
+-                } else if (block->host == NULL) {
+-                    block->host =
+-                        xen_map_cache(block->offset, block->length, 1);
+-                }
+-            }
+             return block->host + (addr - block->offset);
+         }
+     }
+@@ -2793,25 +2770,24 @@ static void *qemu_safe_ram_ptr(ram_addr_t addr)
+  * but takes a size argument */
+ static void *qemu_ram_ptr_length(ram_addr_t addr, ram_addr_t *size)
+ {
++    RAMBlock *block;
++
+     if (*size == 0) {
+         return NULL;
+     }
+-    if (xen_enabled()) {
+-        return xen_map_cache(addr, *size, 1);
+-    } else {
+-        RAMBlock *block;
+ 
+-        QLIST_FOREACH(block, &ram_list.blocks, next) {
+-            if (addr - block->offset < block->length) {
+-                if (addr - block->offset + *size > block->length)
+-                    *size = block->length - addr + block->offset;
+-                return block->host + (addr - block->offset);
+-            }
++    QLIST_FOREACH(block, &ram_list.blocks, next) {
++        if (addr - block->offset < block->length) {
++            if (addr - block->offset + *size > block->length)
++                *size = block->length - addr + block->offset;
++            return block->host + (addr - block->offset);
+         }
+-
+-        fprintf(stderr, "Bad ram offset %" PRIx64 "\n", (uint64_t)addr);
+-        abort();
+     }
++
++    fprintf(stderr, "Bad ram offset %" PRIx64 "\n", (uint64_t)addr);
++    abort();
++
++    return NULL;
+ }
+ 
+ void qemu_put_ram_ptr(void *addr)
+@@ -2824,11 +2800,6 @@ int qemu_ram_addr_from_host(void *ptr, ram_addr_t *ram_addr)
+     RAMBlock *block;
+     uint8_t *host = ptr;
+ 
+-    if (xen_enabled()) {
+-        *ram_addr = xen_ram_addr_from_mapcache(ptr);
+-        return 0;
+-    }
+-
+     QLIST_FOREACH(block, &ram_list.blocks, next) {
+         /* This case append when the block is not mapped. */
+         if (block->host == NULL) {
+@@ -3639,9 +3610,6 @@ void address_space_unmap(AddressSpace *as, void *buffer, hwaddr len,
+                 access_len -= l;
+             }
+         }
+-        if (xen_enabled()) {
+-            xen_invalidate_map_cache_entry(buffer);
+-        }
+         return;
+     }
+     if (is_write) {
+diff --git a/xen-all.c b/xen-all.c
+index af9e754..0adfcd1 100644
+--- a/xen-all.c
++++ b/xen-all.c
+@@ -20,6 +20,7 @@
+ #include "range.h"
+ #include "xen-mapcache.h"
+ #include "trace.h"
++#include "bitmap.h"
+ #include "exec-memory.h"
+ 
+ #include <xen/hvm/ioreq.h>
+@@ -152,7 +153,47 @@ qemu_irq *xen_interrupt_controller_init(void)
+     return qemu_allocate_irqs(xen_set_irq, NULL, 16);
+ }
+ 
++#define LOG_UNMAPPED_PAGES 0
++
+ /* Memory Ops */
++uint8_t *xen_map_memory(target_phys_addr_t addr, target_phys_addr_t size)
++{
++    target_phys_addr_t nb_pfn = size >> XC_PAGE_SHIFT;
++    uint8_t *ret;
++    unsigned long *err_bits;
++    int err_bits_longs = (nb_pfn + 63)/64;
++
++    err_bits = g_malloc0(err_bits_longs*8);
++
++    ret = xc_map_foreign_consec(xen_xc, xen_domid, PROT_READ|PROT_WRITE,
++				addr >> XC_PAGE_SHIFT, nb_pfn,
++				err_bits);
++#if LOG_UNMAPPED_PAGES
++    qemu_log("%s : xc_map_foreign_consec addr:%p pages:0x%05x\n",
++	     __FUNCTION__, ret, (unsigned int)nb_pfn);
++#endif
++    if (ret == NULL) {
++        perror("call to xc_map_foreign_consec");
++        exit(-1);
++    }
++
++#if LOG_UNMAPPED_PAGES
++    {
++	unsigned long long i, err_found = 0;
++	for (i = 0; i < nb_pfn; i++) {
++	    if (test_bit(i, err_bits)) {
++		qemu_log("%s : unmappable address:0x%016llx\n",
++			 __FUNCTION__,
++			 (unsigned long long)(addr + (i << XC_PAGE_SHIFT)));
++		err_found++;
++	    }
++	}
++	qemu_log("%s : %smapping errors found\n", __FUNCTION__, err_found ? "" : "no ");
++    }
++#endif
++    g_free(err_bits);
++    return (ret);
++}
+ 
+ static void xen_ram_init(ram_addr_t ram_size)
+ {
+@@ -780,7 +821,6 @@ static void handle_ioreq(ioreq_t *req)
+         case IOREQ_TYPE_TIMEOFFSET:
+             break;
+         case IOREQ_TYPE_INVALIDATE:
+-            xen_invalidate_map_cache();
+             break;
+         default:
+             hw_error("Invalid ioreq type 0x%x\n", req->type);
+@@ -1135,7 +1175,6 @@ int xen_hvm_init(void)
+     state->bufioreq_local_port = rc;
+ 
+     /* Init RAM management */
+-    xen_map_cache_init(xen_phys_offset_to_gaddr, state);
+     xen_ram_init(ram_size);
+ 
+     qemu_add_vm_change_state_handler(xen_hvm_change_state_handler, state);

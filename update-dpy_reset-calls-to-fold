@@ -1,0 +1,105 @@
+diff --git a/console.c b/console.c
+index ee22509..0d9ea98 100644
+--- a/console.c
++++ b/console.c
+@@ -240,12 +240,6 @@ void display_hw_invalidate(DisplayState *ds)
+         ds->hw_invalidate(ds->vga_state);
+ }
+ 
+-void display_hw_thumbnail_dump(DisplayState *ds, const char *filename)
+-{
+-    if (ds && ds->hw_thumbnail_dump)
+-        ds->hw_thumbnail_dump(ds->vga_state, filename);
+-}
+-
+ /* convert a RGBA color to a color index usable in graphic primitives */
+ static unsigned int vga_get_color(DisplayState *ds, unsigned int rgba)
+ {
+diff --git a/console.h b/console.h
+index 2944818..287dca7 100644
+--- a/console.h
++++ b/console.h
+@@ -173,7 +173,6 @@ typedef void (*vga_hw_screen_dump_ptr)(void *, const char *, bool cswitch,
+                                        Error **errp);
+ typedef void (*vga_hw_text_update_ptr)(void *, console_ch_t *);
+ typedef DisplayState * (*vga_hw_add_display_ptr)(void *);
+-typedef void (*display_hw_thumbnail_dump_ptr)(void *, const char *);
+ 
+ struct DisplayChangeListener {
+     int idle;
+@@ -199,17 +198,6 @@ struct DisplayChangeListener {
+     void (*dpy_mouse_set)(struct DisplayState *s, int x, int y, int on);
+     void (*dpy_cursor_define)(struct DisplayState *s, QEMUCursor *cursor);
+     void (*dpy_cursor_enable)(struct DisplayState *s, bool state);
+-    void (*hw_set_resolution)(void *opaque);
+-    void (*hw_set_orientation)(DisplayState *ds, uint32_t x, uint32_t y, uint32_t r);
+-    void (*hw_store_edid)(DisplayState *ds, uint8_t *edid, size_t edid_size);
+-    vga_hw_update_ptr hw_update;
+-    vga_hw_invalidate_ptr hw_invalidate;
+-    vga_hw_notify_ptr hw_notify;
+-    display_hw_thumbnail_dump_ptr hw_thumbnail_dump;
+-
+-    /* Opaque structure to pass to hw_callbacks. Filled in by hw. */
+-    void *vga_state;
+-    
+ 
+     QLIST_ENTRY(DisplayChangeListener) next;
+ };
+@@ -222,6 +210,16 @@ struct DisplayState {
+     bool have_gfx;
+     bool have_text;
+ 
++    void (*hw_set_resolution)(void *opaque);
++    void (*hw_set_orientation)(DisplayState *ds, uint32_t x, uint32_t y, uint32_t r);
++    void (*hw_store_edid)(DisplayState *ds, uint8_t *edid, size_t edid_size);
++    vga_hw_update_ptr hw_update;
++    vga_hw_invalidate_ptr hw_invalidate;
++    vga_hw_notify_ptr hw_notify;
++
++    /* Opaque structure to pass to hw_callbacks. Filled in by hw. */
++    void *vga_state;
++    
+     QLIST_HEAD(, DisplayChangeListener) listeners;
+ 
+     uint32_t display_id;
+@@ -398,26 +396,23 @@ static inline bool dpy_cursor_define_supported(struct DisplayState *s)
+ }
+ 
+ static inline void dpy_lock(struct DisplayState *s) {
+-    struct DisplayChangeListener *dcl = s->listeners;
+-    while (dcl != NULL) {
++    struct DisplayChangeListener *dcl;
++    QLIST_FOREACH(dcl, &s->listeners, next) {
+         if (dcl->dpy_lock) dcl->dpy_lock(s);
+-        dcl = dcl->next;
+     }
+ }
+ 
+ static inline void dpy_unlock(struct DisplayState *s) {
+-    struct DisplayChangeListener *dcl = s->listeners;
+-    while (dcl != NULL) {
++    struct DisplayChangeListener *dcl;
++    QLIST_FOREACH(dcl, &s->listeners, next) {
+         if (dcl->dpy_unlock) dcl->dpy_unlock(s);
+-        dcl = dcl->next;
+     }
+ }
+ 
+ static inline void dpy_reset(struct DisplayState *s) {
+-    struct DisplayChangeListener *dcl = s->listeners;
+-    while (dcl != NULL) {
++    struct DisplayChangeListener *dcl;
++    QLIST_FOREACH(dcl, &s->listeners, next) {
+         if (dcl->dpy_reset) dcl->dpy_reset(s);
+-        dcl = dcl->next;
+     }
+ }
+ 
+@@ -511,7 +506,6 @@ DisplayState *vga_hw_add_display(void);
+ /* Multi-display, framebuffer only versions of the above vga_hw functions */
+ void display_hw_update(DisplayState *ds);
+ void display_hw_invalidate(DisplayState *ds);
+-void display_hw_thumbnail_dump(DisplayState *ds, const char *filename);
+ void display_hw_notify(DisplayState *ds, gn_cmd_t cmd, int value);
+ 
+ int is_graphic_console(void);

@@ -1,0 +1,1234 @@
+diff --git a/hw/Makefile.objs b/hw/Makefile.objs
+index 65f75ae..c0761c5 100644
+--- a/hw/Makefile.objs
++++ b/hw/Makefile.objs
+@@ -139,6 +139,7 @@ common-obj-$(CONFIG_DP8393X) += dp8393x.o
+ common-obj-$(CONFIG_DS1225Y) += ds1225y.o
+ common-obj-$(CONFIG_MIPSNET) += mipsnet.o
+ common-obj-$(CONFIG_VGA_PCI) += pvaudio.o
++common-obj-$(CONFIG_VGA_PCI) += vga-orc.o
+ 
+ common-obj-y += null-machine.o
+ 
+diff --git a/hw/pc.h b/hw/pc.h
+index e7e48fb..0827f81 100644
+--- a/hw/pc.h
++++ b/hw/pc.h
+@@ -157,6 +157,9 @@ int isa_vga_mm_init(hwaddr vram_base,
+                     hwaddr ctrl_base, int it_shift,
+                     MemoryRegion *address_space);
+ 
++/* vga-orc.c */
++DeviceState *orc_vga_init(PCIBus *bus);
++
+ /* ne2000.c */
+ static inline bool isa_ne2000_init(ISABus *bus, int base, int irq, NICInfo *nd)
+ {
+diff --git a/hw/pc_piix.c b/hw/pc_piix.c
+index 676bff7..4fd32a0 100644
+--- a/hw/pc_piix.c
++++ b/hw/pc_piix.c
+@@ -166,7 +166,12 @@ static void pc_init1(MemoryRegion *system_memory,
+ 
+     pc_register_ferr_irq(gsi[13]);
+ 
+-    pc_vga_init(isa_bus, pci_enabled ? pci_bus : NULL);
++    if (orc_vga_enabled && pci_enabled) {
++        orc_vga_init(pci_bus);
++    } else {
++        pc_vga_init(isa_bus, pci_enabled ? pci_bus : NULL);
++    }
++
+     if (xen_enabled()) {
+         pci_create_simple(pci_bus, -1, "xen-platform");
+     }
+diff --git a/hw/vga-orc-resolutions.h b/hw/vga-orc-resolutions.h
+new file mode 100644
+index 0000000..560b1e7
+--- /dev/null
++++ b/hw/vga-orc-resolutions.h
+@@ -0,0 +1,77 @@
++ep_geometry_t orc_supported_modes[ORC_VGA_GEOMETRY_COUNT] = {
++        /* Legacy modes */
++        {        640,    400,    8,             0 },
++        {        640,    480,    8,             0 },
++        {        800,    600,    8,             0 },
++        {       1024,    768,    8,             0 },
++        {       1280,   1024,    8,             0 },
++        {        320,    200,   16,             0 },
++        {        320,    200,   24,             0 },
++        {        640,    480,   16,             0 },
++        {        640,    480,   24,             0 },
++        {        800,    600,   16,             0 },
++        {        800,    600,   24,             0 },
++        {       1024,    768,   16,             0 },
++        {       1024,    768,   24,             0 },
++        {       1280,   1024,   16,             0 },
++        {       1280,   1024,   16,             0 },
++
++        /* "Common" modes (http://en.wikipedia.org/wiki/VESA_BIOS_Extensions) */
++        {        640,    480,   32,             0 },
++        {        800,    600,   32,             0 },
++        {       1024,    768,   32,             0 },
++        {       1280,   1024,   32,             0 },
++        {       1600,   1200,   32,             0 },
++        {       1152,    864,   32,             0 },
++
++        /* ORC VESA modes */
++        {       1152,    720,   32,             0 },
++        {       1152,    768,   32,             0 },
++        {       1152,    864,   32,             0 },
++
++        {       1280,    720,   32,             0 },
++        {       1280,    768,   32,             0 },
++        {       1280,    800,   32,             0 },
++        {       1280,    854,   32,             0 },
++        {       1280,    960,   32,             0 },
++
++        /* Buggy Flatron W1943TB */
++        {       1360,    768,   32,             0 },
++
++        {       1366,    768,   32,             0 },
++
++        {       1400,   1050,   32,             0 },
++
++        {       1440,    768,   32,             0 },
++        {       1440,    900,   32,             0 },
++        {       1440,    960,   32,             0 },
++        {       1440,   1080,   32,             0 },
++
++        {       1600,    768,   32,             0 },
++        {       1600,    900,   32,             0 },
++        {       1600,   1024,   32,             0 },
++        {       1600,   1200,   32,             0 },
++
++        {       1680,   1050,   32,             0 },
++
++        {       1920,   1080,   32,             0 },
++
++        /* modes which require 16MB frame buffer */
++        {       1920,   1200,   32,             0 },
++        {       1920,   1400,   32,             0 },
++        {       1920,   1440,   32,             0 },
++
++        {       2048,   1107,   32,             0 },
++        {       2048,   1152,   32,             0 },
++        {       2048,   1280,   32,             0 },
++        {       2048,   1536,   32,             0 },
++
++        {       2560,   1440,   32,             0 },
++        {       2560,   1600,   32,             0 },
++        /* modes which require 32MB frame buffer */
++        {       2560,   2048,   32,             0 },
++        {       3840,   2160,   32,             0 },
++
++        /* end-of-list */
++        { 0, 0, 0, 0 },
++};
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+new file mode 100644
+index 0000000..e0d317c
+--- /dev/null
++++ b/hw/vga-orc.c
+@@ -0,0 +1,765 @@
++/*
++ * VGA-ORC PCI VGA Emulator.
++ *
++ * Copyright (c) Citrix Systems Inc.
++ *
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ *
++ * The above copyright notice and this permission notice shall be included in
++ * all copies or substantial portions of the Software.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
++ * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
++ * THE SOFTWARE.
++ */
++#include <xenctrl.h>
++#include "hw.h"
++#include "console.h"
++#include "pc.h"
++#include "pci.h"
++#include "vga_int.h"
++#include "pixel_ops.h"
++#include "qemu-timer.h"
++#include "loader.h"
++#include "xen_backend.h"
++#include "orc_debug.h"
++#include "range.h"
++#include "vga-orc.h"
++#include "vga-orc-resolutions.h"
++
++#include <math.h>
++
++uint64_t    vga_shm_mode_set_count;
++
++typedef struct ORCVGAState {
++    PCIDevice      dev;
++    VGACommonState vga;
++
++    uint16_t       cursor_generation;
++    uint8_t        cursor_flags;
++    uint8_t        cursor_disable_counter;
++    bool           color_cursor;
++    
++    bool           foreign_fb_initialized;
++
++    uint8_t        num_displays;
++} ORCVGAState;
++
++static const VMStateDescription vmstate_vga_orc = {
++    .name = "vga",
++    .version_id = 2,
++    .minimum_version_id = 2,
++    .minimum_version_id_old = 2,
++    .fields      = (VMStateField []) {
++        VMSTATE_PCI_DEVICE(dev, ORCVGAState),
++        VMSTATE_STRUCT(vga, ORCVGAState, 0, vmstate_vga_common, VGACommonState),
++        VMSTATE_END_OF_LIST()
++    }
++};
++
++static void orc_vga_map(PCIDevice *pci_dev,
++                        pcibus_t addr, pcibus_t size)
++{
++    ORCVGAState *o = DO_UPCAST(ORCVGAState, dev, pci_dev);
++    VGACommonState *s = &o->vga;
++    PCIIORegion *r;
++    pcibus_t new_addr;
++
++    r = &pci_dev->io_regions[0];
++    new_addr = addr;
++
++    qemu_log("%s: addr = 0x%lx, size = 0x%lx, old_addr = 0x%lx",
++             __FUNCTION__, addr, size, r->addr);
++
++    /* This bar isn't changed */
++    if (new_addr == r->addr)
++        return;
++
++    pci_set_long(pci_dev->config + PCI_BASE_ADDRESS_0, addr);
++
++    dpy_lock(s->ds);
++
++    if (r->addr != PCI_BAR_UNMAPPED) {
++        memory_region_del_subregion(r->address_space, r->memory);
++    }
++
++    vga_dirty_log_stop(s);
++
++    memory_region_destroy(r->memory);
++
++    memory_region_init_ram_phys(r->memory,
++                                NULL,
++                                "shared_vram",
++                                size, addr);
++
++    r->addr = new_addr;
++
++    (void)xc_domain_pin_memory_cacheattr(
++        xen_xc, xen_domid,
++        addr >> XC_PAGE_SHIFT,
++        (addr + size) >> XC_PAGE_SHIFT,
++        XEN_DOMCTL_MEM_CACHEATTR_WB);
++
++    memory_region_add_subregion_overlap(r->address_space, r->addr, r->memory, 1);
++
++    s->vram_ptr = memory_region_get_ram_ptr(r->memory);
++
++    xen_register_framebuffer(r->memory);
++
++    vga_dirty_log_start(s);
++    o->foreign_fb_initialized = 1;
++
++    dpy_unlock(s->ds);
++}
++
++static void orc_vga_write_config(PCIDevice *d,
++                                 uint32_t address, uint32_t val, int len)
++{
++    int i, was_irq_disabled = pci_get_word(d->config + PCI_COMMAND) * PCI_COMMAND_INTX_DISABLE;
++    pcibus_t orig_val = val;
++    DisplayState *ds = NULL;
++
++    qemu_log("%s: addr = 0x%8x val = 0x%8x len = %x\n", __FUNCTION__, address, val, len);
++
++    for (i = 0; i < len; val >>= 8, ++i) {
++        uint8_t wmask = d->wmask[address + i];
++        uint8_t w1cmask = d->w1cmask[address + i];
++        assert(!(wmask & w1cmask));
++        d->config[address + i] = (d->config[address + i] & ~wmask) | (val & wmask);
++        d->config[address + i] &= ~(val & w1cmask); /* W1C: Write 1 to Clear */
++    }
++
++    if (ranges_overlap(address, len, PCI_BASE_ADDRESS_0, 24)) {
++        pcibus_t bar_addr;
++        ORCVGAState *po = DO_UPCAST(ORCVGAState, dev, d);
++        VGACommonState *s = &po->vga;
++        vga_control_page_t *vcp = NULL;
++
++        switch(address) {
++        case PCI_BASE_ADDRESS_0:
++            bar_addr = orig_val & ~(vga_ram_size() - 1);
++            if (orig_val != 0xFFFFFFFF && bar_addr != 0)
++                orc_vga_map(d, bar_addr, vga_ram_size());
++
++            if (po->foreign_fb_initialized) {
++                vcp = GET_VCP((uint8_t *)s->vram_ptr);
++                vcp->host_magic = ORC_VGA_MAGIC;
++                vcp->version = ORC_VGA_REVISION;
++                memcpy(vcp->supported_modes, orc_supported_modes, sizeof(orc_supported_modes));
++            }
++            for (ds = get_displaystate(); ds; ds = ds->next) {
++                if (ds->vga_state == po) {
++                    dpy_reset(ds);
++                }
++            }
++            break;
++        }
++        return;
++    }
++
++    if (range_covers_byte(address, len, PCI_COMMAND))
++        pci_update_irq_disabled(d, was_irq_disabled);
++}
++
++static DisplayState *find_ds(uint32_t display_id)
++{
++    DisplayState *ds;
++
++    for (ds = get_displaystate(); ds != NULL; ds = ds->next) {
++        if (ds->display_id == display_id) {
++            break;
++        }
++    }
++    return ds;
++}
++
++static void orc_vga_set_resolution(void *opaque)
++{
++    ORCVGAState *o = opaque;
++    VGACommonState *s = &o->vga;
++    vga_control_page_t *vcp = GET_VCP((uint8_t *)s->vram_ptr);
++    ep_geometry_t	*g = (ep_geometry_t *)&vcp->geometry;
++    DisplayState	*ds;
++    uint32_t             display_id = 0;
++
++    if (!o->foreign_fb_initialized || !IS_VCP_VALID(vcp) || !vcp->geometry.cmd)
++        return;
++
++    display_id = vcp->geometry.cmd >> 8;
++
++    ds = find_ds(display_id);
++
++    if (!ds)
++        return;
++
++    /* Non-VGA displays work differently */
++    if (display_id > 0) {
++
++        if (ds_get_data(ds)) {
++                qemu_free_displaysurface(ds);
++        }
++        ds->surface = qemu_create_displaysurface_from(g->width,
++                                                      g->height,
++                                                      g->depth,
++                                                      g->width * g->depth/8,
++                                                      s->vram_ptr + (vcp->display[display_id].fb_offset));
++        g->cmd = 0;
++        dpy_gfx_resize(ds);
++        return;
++    }
++
++    s->vbe_regs[VBE_DISPI_INDEX_XRES] = vcp->geometry.width;
++    s->vbe_regs[VBE_DISPI_INDEX_YRES] = vcp->geometry.height;
++    s->vbe_regs[VBE_DISPI_INDEX_BPP] = vcp->geometry.depth;
++    s->vbe_regs[VBE_DISPI_INDEX_ENABLE] |= VBE_DISPI_ENABLED;
++
++    /*
++     * Standard VGA stuff that the BIOS would have done. Docs from:
++     *  http://www.osdever.net/FreeVGA/vga/vga.htm
++     *
++     *  gr (Graphics)  registers: http://www.osdever.net/FreeVGA/vga/graphreg.htm
++     *  cr (CRTC)      registers: http://www.osdever.net/FreeVGA/vga/crtcreg.htm
++     *  sr (Sequencer) registers: http://www.osdever.net/FreeVGA/vga/seqreg.htm
++     */
++
++    s->gr[VGA_GFX_MODE] &= ~0xE0; /* Clear Shift control (bits 5 & 6) */
++    if (g->depth > 8)
++        s->gr[VGA_GFX_MODE] |= 0x40;  /* Shift registers support more than 256 colors (bit 6) */
++        
++    if (g->depth == 4) {
++        s->sr[VGA_SEQ_CLOCK_MODE] &= ~0x08; /* Normal dot clock rate (clear bit 4) */
++    } else {
++        s->sr[VGA_SEQ_MEMORY_MODE] |= 0x08; /* set chain 4 mode */
++        s->sr[VGA_SEQ_PLANE_WRITE] |= VGA_SR02_ALL_PLANES; /* activate all planes */            
++    }
++    s->cr[VGA_CRTC_MAX_SCAN] = 0; /* No scanline doubling */
++
++    s->cr[VGA_CRTC_MODE] |= 0x3; /* Enable Map Display Address 13 & 14 / Disable CGA */
++
++    /*
++     * Offset = Width / ( PixelsPerAddress * MemoryAddressSize * 2 )
++     * Stuff in cr0x13
++     */
++    if (g->depth == 4)
++        s->vbe_line_offset = g->width >> 1;
++    else
++        s->vbe_line_offset = g->width * ((g->depth + 7) >> 3);
++
++    s->cr[VGA_CRTC_OFFSET] = s->vbe_line_offset >> 3;
++
++    s->vbe_start_addr = 0;
++
++    s->gr[VGA_GFX_MISC] = (s->gr[VGA_GFX_MISC] & ~0x0c) | 0x05; /* graphic mode + memory map 1 */
++    /* width */
++    s->cr[VGA_CRTC_H_DISP] = (s->vbe_regs[VBE_DISPI_INDEX_XRES] >> 3) - 1;
++    /* height - Bits 8 & 9 go in CRTC_OVERFLOW (cr[0x07]) */
++    s->cr[VGA_CRTC_V_DISP_END] = g->height - 1;
++    s->cr[VGA_CRTC_OVERFLOW] = (s->cr[VGA_CRTC_OVERFLOW] & ~0x42) |
++        (((g->height - 1) >> 7) & 0x02) | ((g->height - 1) & 0x40); 
++
++    /* Don't use line compare for split screen. */
++    s->cr[VGA_CRTC_LINE_COMPARE] = 0xff;
++    s->cr[VGA_CRTC_OVERFLOW] |= 0x10; /* Bit 8 of Line compare goes in bit 4 of OVERFLOW */
++    s->cr[VGA_CRTC_MAX_SCAN] |= 0x40; /* Bit 9 of Line compare goes in bit 6 of MAX_SCAN */
++
++    /* starting address */
++    s->cr[VGA_CRTC_START_LO] = (vcp->display[display_id].fb_offset / 4) & 0xFF;
++    s->cr[VGA_CRTC_START_HI] = ((vcp->display[display_id].fb_offset / 4) >> 8) && 0xFF;
++
++    /* Force a re-alloc of the surface */
++    s->last_width = 0;
++    s->last_height = 0;
++    s->last_depth = 0;
++
++    vcp->geometry.cmd = 0;
++    vga_shm_mode_set_count++;
++}
++
++void orc_vga_notify_xen_guest_int(const char *leaf, int val)
++{
++#if CONFIG_XEN_BACKEND
++    char path[64];
++
++    if (!xen_enabled())
++        return;
++
++    snprintf(path, sizeof(path), "/local/domain/%d/control/display", xen_domid);
++    xenstore_write_int(path, leaf, val);
++#endif
++}
++
++/*
++ * Set configuration state.
++ */
++void
++orc_vga_notify(void *opaque, gn_cmd_t cmd, int value)
++{
++    ORCVGAState *o = opaque;
++    VGACommonState *s = &o->vga;
++    vga_control_page_t *vcp;
++
++    if (!o->foreign_fb_initialized)
++        return;
++
++    vcp = GET_VCP((uint8_t *)s->vram_ptr);
++
++    switch (cmd) {
++    case GN_MONITOR_PNP:
++        if (vcp && value) {
++            vcp->force_monitor_pnp++;
++            orc_vga_notify_xen_guest_int("monitor_pnp", vcp->force_monitor_pnp);
++        }
++        break;
++
++    case GN_DISPLAY_CONFIG:
++        if (vcp) {
++            vcp->display_config = (uint32_t)value;
++            orc_vga_notify_xen_guest_int("config", value);
++        }
++        break;
++    case GN_MOUSE_ENABLED:
++        if (vcp) {
++            vcp->pv_mouse = PV_MOUSE_CONFIGURED;
++            orc_vga_notify_xen_guest_int("pv_mouse", PV_MOUSE_CONFIGURED);
++        }
++        break;
++    default:
++        break;
++    }
++}
++
++static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
++{
++    VGACommonState *s = &o->vga;
++    vga_control_page_t *vcp;
++
++    int data_len;
++    int and_mask_len;
++    int i, j, bpp;
++
++    uint8_t cursor_data[ORC_VGA_CURSOR_SIZE_MAX];
++    uint32_t pixels[ORC_VGA_CURSOR_SIZE_MAX];
++    cursor_data_t *cursor;
++    QEMUCursor *qcursor;
++            
++    uint16_t cursor_generation;
++
++    if (!o->foreign_fb_initialized)
++        return o->cursor_generation;
++
++    vcp = GET_VCP(s->vram_ptr);
++
++    cursor_generation = vcp->cursor_generation;
++
++    if (!IS_VCP_VALID(vcp))
++        return cursor_generation;
++
++    if (cursor_generation & 0x1) {
++        /* Odd generation count means that an update is in progress. */
++        return o->cursor_generation;
++    } else {
++        memcpy(cursor_data, (uint8_t *)vcp->cursor_data, ORC_VGA_CURSOR_SIZE_MAX);
++        if (cursor_generation != vcp->cursor_generation) {
++            /*
++             * Didn't get all the data before another update started.
++             * Punt and try again next frame.
++             */
++            return o->cursor_generation;
++        }
++    }
++
++    cursor = (cursor_data_t *)cursor_data;
++
++    if (cursor->width == 0 || cursor->height == 0) {
++        qemu_log("%s: ERROR - Invalid w(%d), h(%d) - "
++                 "ignoring cursor\n",
++                 __FUNCTION__, cursor->width, cursor->height);
++        return cursor_generation;
++    }
++
++    bpp = (cursor->width_in_bytes * 8) / cursor->width;
++
++    data_len = (cursor->width * cursor->height * bpp / 8);
++
++    if (data_len & 3) {
++        qemu_log("%s: ERROR - HW Cursor length not divisible by 4. "
++                 "Cursor will be garbled.", __FUNCTION__);
++    }
++
++    if (data_len > ORC_VGA_CURSOR_SIZE_MAX) {
++        qemu_log("%s: ERROR - HW Cursor length invalid (0x%x) - retaining previous cursor",
++                 __FUNCTION__, data_len);
++        return cursor_generation;
++    }
++
++    switch (bpp) {
++    case 1:
++        and_mask_len = cursor->width * cursor->height / 8;
++        for (i = 0; i < cursor->width * cursor->height; i++) {
++            uint8_t alpha;
++            uint32_t rgb;
++
++            /*
++             * The first (width * height) bits of the buffer contain
++             * the AND mask. If the pixel's bit in the AND mask is set
++             * the pixel is opaque, otherwise it's transparent. 
++             * Translate the AND mask to 8-bit alpha data.
++             */
++            if (cursor->pixels[i / 8] & (1 << (7 - (i % 8))))
++                alpha = 0x00;
++            else
++                alpha = 0xFF;
++                    
++            /*
++             * Just after the AND mask is the XOR data. Each bit represents
++             * whether the pixel should be colored with the foreground or 
++             * background color.
++             *
++             * Set the RGB values as appropriate.
++             */
++            if (cursor->pixels[and_mask_len + (i / 8)] & (1 << (7 - (i % 8))))
++                rgb = o->color_cursor ? 0xF2F200 : 0xFFFFFF;
++            else
++                rgb = o->color_cursor ? 0xFF0000 : 0x000000;
++
++            /*
++             * The final format is in 32-bit ARGB pixels. Combine the data
++             * from the AND and XOR masks into a single pixel value.
++             */
++            pixels[i] = rgb | (alpha << 24);
++        }
++        break;
++    case 32:
++        /*
++         * In 32bpp mode, the guest should send us an array of ARGB pixels.
++         * Since this is the final format, the data can simply be memcopied.
++         */
++        memcpy(pixels, cursor->pixels, cursor->width * cursor->height * 4);
++        break;
++    default:
++        /* Invalid calculated bpp */
++        qemu_log("%s: ERROR - Invalid calculated bpp %d, orig wid %d\n",
++                 __FUNCTION__, bpp, cursor->width);
++    }
++
++    /* Print out an ASCII art representation of the new cursor to syslog */
++    if (orc_flags && OF_DEBUG_MOUSE) {
++        fprintf (stderr, "New Mouse Cursor: WxH = %dx%d \n    ", cursor->width, cursor->height);
++        for (j = 0; j < cursor->width; j++)
++            fprintf(stderr, "-");
++        fprintf(stderr, "\n");
++        for (i = 0; i < cursor->height; i++) {
++            fprintf(stderr, "%03d|", i);
++            for (j = 0; j < cursor->width; j++) {
++                char outc = ' ';
++
++                if (pixels[(i*cursor->width) + j] & 0xFF000000) {
++
++                    if ( (pixels[(i*cursor->width) + j] & 0xFFFF) >= 0x8888)
++                        outc = '*';
++                    else
++                        outc = '.';
++                }
++
++                if (i == cursor->hs_row && j == cursor->hs_col)
++                    outc = 'o';
++
++                fprintf(stderr, "%c", outc);
++            }
++            fprintf(stderr, "|\n");
++        }
++        fprintf(stderr, "   ");
++        for (j = 0; j < cursor->width; j++)
++            fprintf(stderr, "-");
++        fprintf(stderr, "\n");
++    }
++
++    qcursor = cursor_alloc(cursor->width, cursor->height);
++    qcursor->hot_x = cursor->hs_col;
++    qcursor->hot_y = cursor->hs_row;
++    memcpy(qcursor->data, pixels, cursor->width * cursor->height * 4);
++
++    *new_cursor = qcursor;
++
++    return cursor_generation;
++}
++
++static void orc_vga_update_cursor(ORCVGAState *o, vga_control_page_t *vcp)
++{
++    VGACommonState *s = &o->vga;
++
++    if (IS_VCP_VALID(vcp) && (o->cursor_flags != vcp->cursor_flags)) {
++
++        if (vcp->cursor_flags & CURSOR_FLAGS_ENABLED) {
++            o->cursor_disable_counter = 0;
++            o->cursor_flags = vcp->cursor_flags;
++            dpy_cursor_enable(s->ds, TRUE);
++        } else if (o->cursor_disable_counter <= CURSOR_DISABLE_MIN_FRAMES) {
++            o->cursor_disable_counter++;
++        } else {
++            o->cursor_flags = vcp->cursor_flags;
++            dpy_cursor_enable(s->ds, FALSE);
++        }
++    }
++
++    if (IS_VCP_VALID(vcp) && o->cursor_generation != vcp->cursor_generation) {
++        QEMUCursor *new_cursor = NULL;
++        int16_t new_cursor_generation = 0;
++        new_cursor_generation = orc_vga_get_cursor(o, &new_cursor);
++        if (new_cursor_generation != o->cursor_generation) {
++            o->cursor_generation = new_cursor_generation;
++
++            if (new_cursor) {
++                dpy_cursor_define(s->ds, new_cursor);
++            }
++        }
++    }
++}
++
++static void orc_vga_update(void *opaque)
++{
++    ORCVGAState *o = opaque;
++    VGACommonState *s = &o->vga;
++    vga_control_page_t *vcp = GET_VCP((uint8_t *)s->vram_ptr);
++    DisplayState *ds;
++
++    orc_vga_set_resolution(o);
++
++    orc_vga_update_cursor(o, vcp);
++    /* vga_draw_graphic() will call sync_dirty for us */
++    s->update(s);
++
++    /* VSYNC interrupt is for the primary display only */
++    qemu_set_irq(o->dev.irq[0], 1);
++
++    for (ds = get_displaystate(); ds; ds = ds->next) {
++        if (ds->vga_state == opaque && ds != s->ds) {
++            /* If there are any flags at all, we're not Xen memory. Do a full screen update. */
++            if (ds->surface->flags) {
++                dpy_gfx_update(ds, 0, 0, ds_get_width(ds), ds_get_height(ds));
++            } else {
++                uint32_t line;
++                uint32_t start;
++                uint32_t ndirty   = 0;
++                uint32_t height   = ds_get_height(ds);
++                uint32_t width    = ds_get_width(ds);
++                uint32_t linesize = ds_get_linesize(ds);
++                bool     dirty;
++
++                pcibus_t base_addr = vcp->display[ds->display_id].fb_offset;
++
++                for (line = 0; line < height; line++) {
++
++                    /* get the dirty bits for the page(s) holding this scanline */
++                    dirty = memory_region_get_dirty(&s->vram, base_addr + (line * linesize),
++                                                         linesize, DIRTY_MEMORY_VGA);
++                    /*
++                     * Add lines until we find a clean one, then update the dirty
++                     * lines as a single region.
++                     */
++                    if (dirty) {
++                        if (!ndirty) {
++                            start = line;
++                        }
++
++                        ndirty++;
++
++                    } else if (ndirty) {
++                        dpy_gfx_update(ds, 0, start, width, ndirty);
++
++                        /* Reset the dirty state for the entire region. */
++                        memory_region_reset_dirty(&s->vram, base_addr + (start * linesize),
++                                                  linesize * ndirty, DIRTY_MEMORY_VGA);
++
++                        ndirty = 0;
++                    }
++                }
++
++                /* Clean up any remaining dirty scanlines */
++                if (ndirty) {
++                    dpy_gfx_update(ds, 0, start, width, ndirty);
++
++                    /* Reset the dirty state for the final region. */
++                    memory_region_reset_dirty(&s->vram, base_addr + (start * linesize),
++                                              linesize * ndirty, DIRTY_MEMORY_VGA);
++                }
++            }
++        }
++    }
++}
++
++static void orc_vga_store_edid(DisplayState *ds, uint8_t *edid, size_t edid_size)
++{
++    ORCVGAState *o = ds->vga_state;
++    VGACommonState *s = &o->vga;
++    vga_control_page_t *vcp;
++    int i;
++
++    if (!o->foreign_fb_initialized)
++        return;
++
++    vcp = GET_VCP((uint8_t *)s->vram_ptr);
++
++    qemu_log("vga-orc: Giving an EDID for display %d to the VM:\n",
++             ds->display_id);
++
++    edid_size = MIN(edid_size, EDID_SIZE);
++
++    for (i = 0; i < edid_size/8; i++) {
++        qemu_log("0x%02x%02x%02x%02x%02x%02x%02x%02x\n",
++                 edid[i*8 + 0], edid[i*8 + 1],
++                 edid[i*8 + 2], edid[i*8 + 3],
++                 edid[i*8 + 4], edid[i*8 + 5],
++                 edid[i*8 + 6], edid[i*8 + 7]);
++    }
++
++    if (ds->display_id < ORC_VGA_MAX_DISPLAYS && edid && edid_size) {
++        memcpy(vcp->display[ds->display_id].edid, edid, edid_size);
++    }
++}
++
++
++void orc_vga_notify_xen_guest_orientation(DisplayState *ds, uint32_t x,
++        uint32_t y, uint32_t r)
++{
++#if CONFIG_XEN_BACKEND
++    char path[64];
++    char val[64];
++
++    if (!xen_enabled())
++        return;
++
++    snprintf(path, sizeof(path), "/local/domain/%d/control/display/%d",
++            xen_domid, ds->display_id);
++
++    snprintf(val, sizeof(val), "%d,%d,%d", x, y, r);
++    xenstore_write_str(path, "orientation", val);
++#endif
++}
++
++static void orc_vga_set_orientation(DisplayState *ds, uint32_t x, uint32_t y, uint32_t r)
++{
++    ORCVGAState *o = ds->vga_state;
++    VGACommonState *s = &o->vga;
++    vga_control_page_t *vcp;
++
++    if (!o->foreign_fb_initialized)
++        return;
++
++    vcp = GET_VCP((uint8_t *)s->vram_ptr);
++
++    if (ds->display_id < ORC_VGA_MAX_DISPLAYS) {
++        vcp->display[ds->display_id].x = x;
++        vcp->display[ds->display_id].y = y;
++        orc_vga_notify_xen_guest_orientation(ds, x, y, r);
++    }
++}
++
++static DisplayState *orc_vga_add_ds(void *opaque)
++{
++    ORCVGAState *o = opaque;
++    DisplayState *ds;
++
++    if (o->num_displays >= ORC_VGA_MAX_DISPLAYS) {
++        return NULL;
++    }
++
++    ds = g_malloc0(sizeof(DisplayState));
++
++    ds->hw_set_resolution = orc_vga_set_resolution;
++    ds->hw_set_orientation = orc_vga_set_orientation;
++    ds->hw_store_edid = orc_vga_store_edid;
++    ds->hw_notify = orc_vga_notify;
++    ds->vga_state = o;
++
++    o->num_displays++;
++
++    return ds;
++}
++
++static int orc_vga_initfn(PCIDevice *dev)
++{
++    ORCVGAState *o = DO_UPCAST(ORCVGAState, dev, dev);
++    VGACommonState *s = &o->vga;
++    uint8_t *pci_conf = dev->config;
++    uint32_t fd;
++
++    // vga + console init
++    vga_common_init(s);
++    vga_init(s, pci_address_space(dev), pci_address_space_io(dev), true);
++    o->foreign_fb_initialized = 0;    
++
++    s->ds = graphic_console_init(orc_vga_update, s->invalidate,
++                                 s->screen_dump, s->text_update, orc_vga_add_ds, o);
++    
++    s->ds->hw_set_resolution = orc_vga_set_resolution;
++    s->ds->hw_set_orientation = orc_vga_set_orientation;
++    s->ds->hw_store_edid = orc_vga_store_edid;
++    s->ds->hw_notify = orc_vga_notify;
++
++    o->num_displays++;
++    
++    pci_set_word(pci_conf + PCI_COMMAND, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
++
++    pci_set_long(pci_conf + PCI_INTERRUPT_PIN, 0x01);
++ 
++    pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
++    
++    fd = open("/etc/orc/color_cursor", O_RDONLY);
++    if (fd != -1) {
++        qemu_log("Enabling color cursor\n");
++        /* Mark it yes */
++        o->color_cursor = TRUE;
++        close(fd);
++    }
++    
++    return 0;
++}
++
++DeviceState *orc_vga_init(PCIBus *bus)
++{
++    return &pci_create_simple(bus, -1, "ORC-VGA")->qdev;
++    return 0;
++}
++
++static void orc_vga_class_init(ObjectClass *klass, void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++    k->no_hotplug = 1;
++    k->init = orc_vga_initfn;
++    k->vendor_id = PCI_VENDOR_ID_QEMU;
++    k->device_id = PCI_DEVICE_ID_QEMU_VGA;
++    k->class_id = PCI_CLASS_DISPLAY_VGA;
++    k->config_write = orc_vga_write_config;
++    dc->vmsd = &vmstate_vga_orc;
++}
++
++static TypeInfo vga_info = {
++    .name          = "ORC-VGA",
++    .parent        = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(ORCVGAState),
++    .class_init    = orc_vga_class_init,
++};
++
++static void vga_register(void)
++{
++    type_register_static(&vga_info);
++}
++type_init(vga_register);
++
++/* Local Variables: */
++/*   c-indent-level: 4 */
++/*   c-basic-offset: 4 */
++/* End: */
++// vim:ts=4 sw=4 tw=80 expandtab smartindent
+diff --git a/hw/vga-orc.h b/hw/vga-orc.h
+new file mode 100644
+index 0000000..6ccb3b7
+--- /dev/null
++++ b/hw/vga-orc.h
+@@ -0,0 +1,267 @@
++#ifndef __VGA_ORC_H__
++#define __VGA_ORC_H__
++
++#include "hw/hw.h"
++
++/* 
++ * ORC VGA Version:
++ * Version 0:
++ *   - All versions of the original interface (up to NxTop Engine 4.0.x)
++ *
++ * Version 1:
++ *   - Added vga control page at the end of VRAM
++ *   - Deprecated the VBE FIFO (still works for backwards compatibility)
++ *
++ * Version 2:
++ *   - Adds mode set mode query mode to the control page, eliminating the need
++ *     to use the VGA/VBE bios for anything. Control page layout unchanged.
++ *
++ * Version 3:
++ *     Adds support for more than one display port per adapter. 
++ *     Backwards compatible with V2.
++ *     EDID_SIZE is now 256 (was 128).
++ *     ORC_VGA_MAX_DISPLAYS was 1 now 2 will be 4.
++ *     vga_control_page.unused1 is now vga_control_page.portFBsize - defines the FB regions size for each port.
++ *     vga_control_page.nPorts taken out of pad. Set by DOMU to number of configured ports <= ORC_VGA_MAX_DISPLAYS.
++ *     vga_control_page.pad[7] is now vga_control_page.pad[6].
++ *     vga_control_page.geometry.cmd: upper 8 bits now encodes the port that the resolution command applies to.
++ *     vga_control_page.display_data_t contains the EDID (256 bytes) and the DOM0 origin data 
++ *        origin data is assumed to be the coordinates of the upper left corner with 0,0  being the 
++ *        origin of the primary display device. DOMU provides its version of origin data using mouse reports.
++ *
++ *     NB version 3 only supports ONE ADAPTER DEVICE! It should be implemented using a new PCI DID and a 
++ *     new windows driver.
++ * Version 4:
++ *     Adds support for displays[]->fb_offset / variable sized framebuffers
++ */
++
++#define ORC_VGA_REVISION 4
++#define NO_VGA_BIOS_VERSION 2
++
++#define ORC_VGA_MAGIC 0x08C36A1D
++
++#define ORC_VGA_MAX_DISPLAYS 2 /* Increase when we support multiple per adapter */
++
++/* EDID v1.3 with extensions can be a maximum of 32k */
++#define EDID_1_3_MAX    0x8000
++#define ORC_VGA_CONTROL_REGION_SIZE 0x10000
++#define ORC_VGA_EDID_OFFSET (ORC_VGA_CONTROL_REGION_SIZE / 2)
++#define ORC_VGA_GEOMETRY_COUNT 64
++
++#define ORC_VGA_CURSOR_SIZE_MAX 0x4000
++
++#define EDID_SIZE       256
++
++#define GEOMETRY_DATA   256
++#define CONFIG_DATA     1024
++#define PV_MOUSE_CONFIGURED   0x01
++
++typedef struct ep_geometry {
++        uint16_t        width;
++        uint16_t        height;
++        uint16_t        depth;
++        uint16_t        cmd;
++} ep_geometry_t;
++
++typedef struct cursor_data
++{
++    uint32_t hs_col;
++    uint32_t hs_row;
++    uint32_t width;
++    uint32_t height;
++    uint32_t width_in_bytes;
++    uint8_t  pixels[1]; 
++} cursor_data_t;
++
++typedef struct display_data
++{
++    uint8_t     edid[EDID_SIZE]; // first for backwards compatability.
++    // origin
++    uint32_t    x; 
++    uint32_t    y; 
++    uint32_t    rotation;        // DOM0 writes, DOMU reads. 0, 90, 180, 270 only supported values.
++    uint32_t    fb_offset;       // DOMU writes, DOM0 reads. where this port's fb region starts.
++} display_data_t;
++
++
++typedef struct vga_control_page {
++
++    /*
++     * Magic value, set to ORC_VGA_MAGIC by the
++     * guest/host when using the control interface.
++     */
++    union {
++      struct {
++            uint32_t host_magic;  /* OUT */
++            volatile uint32_t guest_magic; /* IN */
++
++            /* Configuration */
++            uint8_t         force_monitor_pnp; /* OUT:    Check for new monitor/EDID update */
++            uint8_t         pv_mouse;          /* OUT:    PV-Mouse is enabled */
++            volatile uint32_t        display_config;    /* IN/OUT: Which monitor is primary/mirrored */
++            uint32_t        portFBsize;        /* OUT: each port uses this much FB. */
++            uint32_t        version;           /* OUT  should be ORC_VGA_REVISION*/
++            volatile ep_geometry_t   geometry;	       /* IN: Current resolution */
++
++            /* Geometry list */
++            ep_geometry_t   supported_modes[ORC_VGA_GEOMETRY_COUNT]; /* OUT */
++
++            /* Hardware Cursor Support */
++            volatile uint8_t         cursor_flags;        /* IN */
++#define CURSOR_FLAGS_ENABLED        0x1
++#define CURSOR_FLAGS_FORMAT_MASK    0xF0
++#define CURSOR_FLAGS_FORMAT_WINDOWS 0x10
++#define CURSOR_FLAGS_FORMAT_X11     0x20
++            volatile uint16_t        cursor_generation;   /* IN: Odd for update-in-progress, even for update-complete */
++            volatile pcibus_t        animated_cursor_ptr; /* IN: Non-NULL if the cursor is a .ANI file located at this address */
++            uint8_t         nPorts;              /* IN: number of ports configured by DOMU. <= ORC_VGA_MAX_DISPLAYS */
++            uint8_t         pad[6];              /* For alignment of cursor_data and edid */
++            volatile uint8_t         cursor_data[ORC_VGA_CURSOR_SIZE_MAX]; /* IN: Raw cursor data */
++          };
++          uint8_t pad_edid[ORC_VGA_EDID_OFFSET];
++        };
++
++    display_data_t		display[ORC_VGA_MAX_DISPLAYS]; /* OUT */
++} vga_control_page_t;
++
++extern ep_geometry_t orc_supported_modes[ORC_VGA_GEOMETRY_COUNT];
++
++extern uint64_t vga_shm_mode_set_count;
++
++#define GET_VCP(x) ((vga_control_page_t *) \
++                    (((uint8_t *)(x)) + (vga_ram_size() - ORC_VGA_CONTROL_REGION_SIZE)))
++
++#define IS_VCP_VALID(x) (o->foreign_fb_initialized && (x != NULL) && (x->guest_magic == ORC_VGA_MAGIC))
++
++/*
++ * Minimum number of frames the needs to have been disabled for before
++ * we honor the request.
++ */
++#define CURSOR_DISABLE_MIN_FRAMES 4
++
++/*
++ * Do not change the ordering here!
++ * Some code relies on it.  If you
++ * add anything, or remove anything,
++ * note that you need to change
++ * config_names below to match...
++ */
++typedef enum display_config {
++        DC_NONE,                /* Uninitialized */
++
++        /* Windows single display configs */
++        DC_INTERNAL,
++        DC_EXTERNAL,
++        DC_MIRROR,
++        DC_DUPE,                /* Duplicate int on ext, but don't display int */
++
++        DC_LAST_SINGLE = DC_DUPE,
++
++        /* Windows dual display configs */
++        DC_INT2EXT,
++        DC_EXT2INT,
++
++        DC_LAST = DC_EXT2INT
++} dc_t;
++
++void orc_vga_notify(void *opaque, gn_cmd_t cmd, int value);
++
++
++/* Standard VGA register defines from Linux 2.6 include/video/vga.h  */
++
++/* VGA misc register bit masks */
++#define VGA_MIS_COLOR		0x01
++#define VGA_MIS_ENB_MEM_ACCESS	0x02
++#define VGA_MIS_DCLK_28322_720	0x04
++#define VGA_MIS_ENB_PLL_LOAD	(0x04 | 0x08)
++#define VGA_MIS_SEL_HIGH_PAGE	0x20
++
++/* VGA CRT controller register indices */
++#define VGA_CRTC_H_TOTAL	0
++#define VGA_CRTC_H_DISP		1
++#define VGA_CRTC_H_BLANK_START	2
++#define VGA_CRTC_H_BLANK_END	3
++#define VGA_CRTC_H_SYNC_START	4
++#define VGA_CRTC_H_SYNC_END	5
++#define VGA_CRTC_V_TOTAL	6
++#define VGA_CRTC_OVERFLOW	7
++#define VGA_CRTC_PRESET_ROW	8
++#define VGA_CRTC_MAX_SCAN	9
++#define VGA_CRTC_CURSOR_START	0x0A
++#define VGA_CRTC_CURSOR_END	0x0B
++#define VGA_CRTC_START_HI	0x0C
++#define VGA_CRTC_START_LO	0x0D
++#define VGA_CRTC_CURSOR_HI	0x0E
++#define VGA_CRTC_CURSOR_LO	0x0F
++#define VGA_CRTC_V_SYNC_START	0x10
++#define VGA_CRTC_V_SYNC_END	0x11
++#define VGA_CRTC_V_DISP_END	0x12
++#define VGA_CRTC_OFFSET		0x13
++#define VGA_CRTC_UNDERLINE	0x14
++#define VGA_CRTC_V_BLANK_START	0x15
++#define VGA_CRTC_V_BLANK_END	0x16
++#define VGA_CRTC_MODE		0x17
++#define VGA_CRTC_LINE_COMPARE	0x18
++#define VGA_CRTC_REGS		VGA_CRT_C
++
++/* VGA CRT controller bit masks */
++#define VGA_CR11_LOCK_CR0_CR7	0x80 /* lock writes to CR0 - CR7 */
++#define VGA_CR17_H_V_SIGNALS_ENABLED 0x80
++
++/* VGA attribute controller register indices */
++#define VGA_ATC_PALETTE0	0x00
++#define VGA_ATC_PALETTE1	0x01
++#define VGA_ATC_PALETTE2	0x02
++#define VGA_ATC_PALETTE3	0x03
++#define VGA_ATC_PALETTE4	0x04
++#define VGA_ATC_PALETTE5	0x05
++#define VGA_ATC_PALETTE6	0x06
++#define VGA_ATC_PALETTE7	0x07
++#define VGA_ATC_PALETTE8	0x08
++#define VGA_ATC_PALETTE9	0x09
++#define VGA_ATC_PALETTEA	0x0A
++#define VGA_ATC_PALETTEB	0x0B
++#define VGA_ATC_PALETTEC	0x0C
++#define VGA_ATC_PALETTED	0x0D
++#define VGA_ATC_PALETTEE	0x0E
++#define VGA_ATC_PALETTEF	0x0F
++#define VGA_ATC_MODE		0x10
++#define VGA_ATC_OVERSCAN	0x11
++#define VGA_ATC_PLANE_ENABLE	0x12
++#define VGA_ATC_PEL		0x13
++#define VGA_ATC_COLOR_PAGE	0x14
++
++#define VGA_AR_ENABLE_DISPLAY	0x20
++
++/* VGA sequencer register indices */
++#define VGA_SEQ_RESET		0x00
++#define VGA_SEQ_CLOCK_MODE	0x01
++#define VGA_SEQ_PLANE_WRITE	0x02
++#define VGA_SEQ_CHARACTER_MAP	0x03
++#define VGA_SEQ_MEMORY_MODE	0x04
++
++/* VGA sequencer register bit masks */
++#define VGA_SR01_CHAR_CLK_8DOTS	0x01 /* bit 0: character clocks 8 dots wide are generated */
++#define VGA_SR01_SCREEN_OFF	0x20 /* bit 5: Screen is off */
++#define VGA_SR02_ALL_PLANES	0x0F /* bits 3-0: enable access to all planes */
++#define VGA_SR04_EXT_MEM	0x02 /* bit 1: allows complete mem access to 256K */
++#define VGA_SR04_SEQ_MODE	0x04 /* bit 2: directs system to use a sequential addressing mode */
++#define VGA_SR04_CHN_4M		0x08 /* bit 3: selects modulo 4 addressing for CPU access to display memory */
++
++/* VGA graphics controller register indices */
++#define VGA_GFX_SR_VALUE	0x00
++#define VGA_GFX_SR_ENABLE	0x01
++#define VGA_GFX_COMPARE_VALUE	0x02
++#define VGA_GFX_DATA_ROTATE	0x03
++#define VGA_GFX_PLANE_READ	0x04
++#define VGA_GFX_MODE		0x05
++#define VGA_GFX_MISC		0x06
++#define VGA_GFX_COMPARE_MASK	0x07
++#define VGA_GFX_BIT_MASK	0x08
++
++/* VGA graphics controller bit masks */
++#define VGA_GR06_GRAPHICS_MODE	0x01
++
++void orc_vga_notify_xen_guest_int(const char *leaf, int val);
++void orc_vga_notify_xen_guest_orientation(DisplayState *ds, uint32_t x, uint32_t y, uint32_t r);
++#endif
+diff --git a/mouse.h b/mouse.h
+new file mode 100644
+index 0000000..e44242e
+--- /dev/null
++++ b/mouse.h
+@@ -0,0 +1,25 @@
++#ifndef MOUSE_H
++#define MOUSE_H
++
++#include <pthread.h>
++#include <X11/Xlib.h>
++
++#define CONFIG_PVMOUSE 1
++
++extern void mouse_init(void);
++
++extern void add_mouse_window(Display *dpy, int which, Window win,
++				unsigned w, unsigned h);
++extern void remove_mouse_window(Display *dpy, Window win);
++
++extern void add_clone_mouse_window(Display *dpy, Window win);
++extern void remove_clone_mouse_window(Display *dpy);
++
++extern void reconfigure_mouse(Display *dpy);
++extern void release_mouse_buttons(Display *dpy);
++
++extern int pv_mouse_active(void);	/* Thread is active */
++
++extern void mouse_handle_sigsegv(int signum);
++
++#endif /* MOUSE_H */
+diff --git a/sysemu.h b/sysemu.h
+index 7d42097..8a09d31 100644
+--- a/sysemu.h
++++ b/sysemu.h
+@@ -96,12 +96,13 @@ extern int autostart;
+ extern int bios_size;
+ 
+ typedef enum {
+-    VGA_NONE, VGA_STD, VGA_CIRRUS, VGA_VMWARE, VGA_XENFB, VGA_QXL,
++    VGA_NONE, VGA_STD, VGA_CIRRUS, VGA_VMWARE, VGA_XENFB, VGA_QXL, VGA_ORC,
+ } VGAInterfaceType;
+ 
+ extern int vga_interface_type;
+ #define xenfb_enabled (vga_interface_type == VGA_XENFB)
+ #define qxl_enabled (vga_interface_type == VGA_QXL)
++#define orc_vga_enabled (vga_interface_type == VGA_ORC)
+ 
+ extern int graphic_width;
+ extern int graphic_height;
+diff --git a/vl.c b/vl.c
+index 8cbfb6c..de8da99 100644
+--- a/vl.c
++++ b/vl.c
+@@ -1865,6 +1865,8 @@ static void select_vgahw (const char *p)
+             fprintf(stderr, "Error: standard VGA not available\n");
+             exit(0);
+         }
++    } else if (strstart(p, "orc", &opts)) {
++        vga_interface_type = VGA_ORC;
+     } else if (strstart(p, "cirrus", &opts)) {
+         if (cirrus_vga_available()) {
+             vga_interface_type = VGA_CIRRUS;

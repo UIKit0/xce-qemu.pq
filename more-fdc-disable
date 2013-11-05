@@ -1,0 +1,20 @@
+diff --git a/hw/pc.c b/hw/pc.c
+index 5113a14..84e2676 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -1219,10 +1219,12 @@ void pc_basic_device_init(ISABus *isa_bus, qemu_irq *gsi,
+     cpu_exit_irq = qemu_allocate_irqs(cpu_request_exit, NULL, 1);
+     DMA_init(0, cpu_exit_irq);
+ 
+-    for(i = 0; i < MAX_FD; i++) {
+-        fd[i] = drive_get(IF_FLOPPY, 0, i);
++    if (!xen_enabled()) {    
++        for(i = 0; i < MAX_FD; i++) {
++            fd[i] = drive_get(IF_FLOPPY, 0, i);
++        }
++        *floppy = fdctrl_init_isa(isa_bus, fd);
+     }
+-    *floppy = fdctrl_init_isa(isa_bus, fd);
+ }
+ 
+ void pc_pci_device_init(PCIBus *pci_bus)

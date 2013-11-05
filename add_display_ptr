@@ -1,0 +1,139 @@
+diff --git a/console.c b/console.c
+index 1908233..9337e41 100644
+--- a/console.c
++++ b/console.c
+@@ -126,6 +126,8 @@ struct QemuConsole {
+     vga_hw_invalidate_ptr hw_invalidate;
+     vga_hw_screen_dump_ptr hw_screen_dump;
+     vga_hw_text_update_ptr hw_text_update;
++    vga_hw_add_display_ptr hw_add_display;
++
+     void *hw;
+     int g_width, g_height;
+ 
+@@ -209,6 +211,14 @@ void vga_hw_text_update(console_ch_t *chardata)
+         active_console->hw_text_update(active_console->hw, chardata);
+ }
+ 
++DisplayState *vga_hw_add_display(void)
++{
++    if (active_console && active_console->hw_add_display)
++        return active_console->hw_add_display(active_console->hw);
++
++    return NULL;
++}
++
+ /* Multi-display, framebuffer only versions of the above vga_hw functions */
+ void display_hw_update(DisplayState *ds)
+ {
+@@ -1449,6 +1459,7 @@ DisplayState *graphic_console_init(vga_hw_update_ptr update,
+                                    vga_hw_invalidate_ptr invalidate,
+                                    vga_hw_screen_dump_ptr screen_dump,
+                                    vga_hw_text_update_ptr text_update,
++                                   vga_hw_add_display_ptr add_display,
+                                    void *opaque)
+ {
+     QemuConsole *s;
+@@ -1467,6 +1478,7 @@ DisplayState *graphic_console_init(vga_hw_update_ptr update,
+     s->hw_invalidate = invalidate;
+     s->hw_screen_dump = screen_dump;
+     s->hw_text_update = text_update;
++    s->hw_add_display = add_display;
+     s->hw = opaque;
+     ds->hw_update = update;
+     ds->hw_invalidate = invalidate;
+diff --git a/console.h b/console.h
+index f40e50e..6afea43 100644
+--- a/console.h
++++ b/console.h
+@@ -175,7 +175,8 @@ struct DisplayChangeListener {
+     void (*dpy_mouse_set)(struct DisplayState *s, int x, int y, int on);
+     void (*dpy_cursor_define)(struct DisplayState *s, QEMUCursor *cursor);
+     void (*hw_set_resolution)(void *opaque);
+-    void (*hw_store_edid)(void *opaque, uint8_t *edid, size_t edid_size);
++    void (*hw_set_orientation)(DisplayState *ds, uint32_t x, uint32_t y, uint32_t r);
++    void (*hw_store_edid)(DisplayState *ds, uint8_t *edid, size_t edid_size);
+     vga_hw_update_ptr hw_update;
+     vga_hw_invalidate_ptr hw_invalidate;
+     display_hw_thumbnail_dump_ptr hw_thumbnail_dump;
+@@ -476,6 +477,7 @@ DisplayState *graphic_console_init(vga_hw_update_ptr update,
+                                    vga_hw_invalidate_ptr invalidate,
+                                    vga_hw_screen_dump_ptr screen_dump,
+                                    vga_hw_text_update_ptr text_update,
++                                   vga_hw_add_display_ptr add_display,
+                                    void *opaque);
+ 
+ void vga_hw_update(void);
+diff --git a/hw/cirrus_vga.c b/hw/cirrus_vga.c
+index 9bef96e..ae18cc4 100644
+--- a/hw/cirrus_vga.c
++++ b/hw/cirrus_vga.c
+@@ -2902,7 +2902,7 @@ static int vga_initfn(ISADevice *dev)
+     cirrus_init_common(&d->cirrus_vga, CIRRUS_ID_CLGD5430, 0,
+                        isa_address_space(dev));
+     s->ds = graphic_console_init(s->update, s->invalidate,
+-                                 s->screen_dump, s->text_update,
++                                 s->screen_dump, s->text_update, NULL,
+                                  s);
+     rom_add_vga(VGABIOS_CIRRUS_FILENAME);
+     /* XXX ISA-LFB support */
+@@ -2950,7 +2950,7 @@ static int pci_cirrus_vga_initfn(PCIDevice *dev)
+      vga_common_init(&s->vga);
+      cirrus_init_common(s, device_id, 1, pci_address_space(dev));
+      s->vga.ds = graphic_console_init(s->vga.update, s->vga.invalidate,
+-                                      s->vga.screen_dump, s->vga.text_update,
++                                      s->vga.screen_dump, s->vga.text_update, NULL,
+                                       &s->vga);
+ 
+      /* setup PCI */
+diff --git a/hw/vga-isa.c b/hw/vga-isa.c
+index 046602b..0842a47 100644
+--- a/hw/vga-isa.c
++++ b/hw/vga-isa.c
+@@ -63,7 +63,7 @@ static int vga_initfn(ISADevice *dev)
+                                         vga_io_memory, 1);
+     memory_region_set_coalescing(vga_io_memory);
+     s->ds = graphic_console_init(s->update, s->invalidate,
+-                                 s->screen_dump, s->text_update, s);
++                                 s->screen_dump, s->text_update, NULL, s);
+ 
+     vga_init_vbe(s, isa_address_space(dev));
+     /* ROM BIOS */
+diff --git a/hw/vga-pci.c b/hw/vga-pci.c
+index 2db0a73..8e69cab 100644
+--- a/hw/vga-pci.c
++++ b/hw/vga-pci.c
+@@ -142,7 +142,7 @@ static int pci_std_vga_initfn(PCIDevice *dev)
+     vga_init(s, pci_address_space(dev), pci_address_space_io(dev), true);
+ 
+     s->ds = graphic_console_init(s->update, s->invalidate,
+-                                 s->screen_dump, s->text_update, s);
++                                 s->screen_dump, s->text_update, NULL, s);
+ 
+     /* XXX: VGA_RAM_SIZE must be a power of two */
+     pci_register_bar(&d->dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
+diff --git a/hw/vmware_vga.c b/hw/vmware_vga.c
+index 834588d..a4003aa 100644
+--- a/hw/vmware_vga.c
++++ b/hw/vmware_vga.c
+@@ -1131,7 +1131,7 @@ static void vmsvga_init(struct vmsvga_state_s *s,
+     s->vga.ds = graphic_console_init(vmsvga_update_display,
+                                      vmsvga_invalidate_display,
+                                      vmsvga_screen_dump,
+-                                     vmsvga_text_update, s);
++                                     vmsvga_text_update, NULL, s);
+ 
+ 
+     s->fifo_size = SVGA_FIFO_SIZE;
+diff --git a/hw/xenfb.c b/hw/xenfb.c
+index 442a63a..1b966d5 100644
+--- a/hw/xenfb.c
++++ b/hw/xenfb.c
+@@ -1012,6 +1012,7 @@ wait_more:
+                                     xenfb_invalidate,
+                                     NULL,
+                                     NULL,
++                                    NULL,
+                                     fb);
+     fb->have_console = 1;
+ 

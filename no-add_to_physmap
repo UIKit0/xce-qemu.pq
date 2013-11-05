@@ -1,0 +1,69 @@
+diff --git a/xen-all.c b/xen-all.c
+index 3d0f7e6..1707b23 100644
+--- a/xen-all.c
++++ b/xen-all.c
+@@ -366,6 +366,7 @@ go_physmap:
+ 
+     pfn = phys_offset >> TARGET_PAGE_BITS;
+     start_gpfn = start_addr >> TARGET_PAGE_BITS;
++#if 0
+     for (i = 0; i < size >> TARGET_PAGE_BITS; i++) {
+         unsigned long idx = pfn + i;
+         xen_pfn_t gpfn = start_gpfn + i;
+@@ -377,7 +378,7 @@ go_physmap:
+             return -rc;
+         }
+     }
+-
++#endif
+     physmap = g_malloc(sizeof (XenPhysmap));
+ 
+     physmap->start_addr = start_addr;
+@@ -391,7 +392,7 @@ go_physmap:
+                                    start_addr >> TARGET_PAGE_BITS,
+                                    (start_addr + size) >> TARGET_PAGE_BITS,
+                                    XEN_DOMCTL_MEM_CACHEATTR_WB);
+-
++#if 0
+     snprintf(path, sizeof(path),
+             "/local/domain/0/device-model/%d/physmap/%"PRIx64"/start_addr",
+             xen_domid, (uint64_t)phys_offset);
+@@ -414,7 +415,7 @@ go_physmap:
+             return -1;
+         }
+     }
+-
++#endif
+     return 0;
+ }
+ 
+@@ -431,7 +432,7 @@ static int xen_remove_from_physmap(XenIOState *state,
+     if (physmap == NULL) {
+         return -1;
+     }
+-
++#if 0
+     phys_offset = physmap->phys_offset;
+     size = physmap->size;
+ 
+@@ -452,7 +453,7 @@ static int xen_remove_from_physmap(XenIOState *state,
+             return -rc;
+         }
+     }
+-
++#endif
+     QLIST_REMOVE(physmap, list);
+     if (state->log_for_dirtybit == physmap) {
+         state->log_for_dirtybit = NULL;
+@@ -494,11 +495,6 @@ static void xen_set_memory(struct MemoryListener *listener,
+         return;
+     }
+ 
+-    if (!(section->mr != &ram_memory
+-          && ( (log_dirty && add) || (!log_dirty && !add)))) {
+-        return;
+-    }
+-
+     trace_xen_client_set_memory(start_addr, size, log_dirty);
+ 
+     start_addr &= TARGET_PAGE_MASK;

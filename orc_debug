@@ -1,0 +1,50 @@
+diff --git a/orc_debug.h b/orc_debug.h
+new file mode 100644
+index 0000000..abe4da4
+--- /dev/null
++++ b/orc_debug.h
+@@ -0,0 +1,44 @@
++/*
++ * dynamic debug mask
++ */
++extern unsigned int orc_flags;
++
++/* use high 12 bits for config flags */
++#define OF_PV_DEV_DISABLE       0x00100000
++#define OF_AUDIO_INIT_NORMAL    0x00200000
++#define OF_ENABLE_ISCSI 0X00080000
++
++#define OF_VIDEO_REFRESH        0xff000000
++#define OF_VR_SHIFT             24
++#define GET_OF_VIDEO_REFRESH()  ((orc_flags & OF_VIDEO_REFRESH) >> OF_VR_SHIFT)
++
++/* use low 20 bits for debug flags */
++#define OF_DEBUG_KB             0x00000001
++#define OF_DEBUG_MOUSE          0x00000002
++#define OF_DEBUG_INPUT          (OF_DEBUG_KB | OF_DEBUG_MOUSE)
++#define OF_DEBUG_WDDM           0x00000004
++#define OF_DEBUG_PM             0x00000008
++
++#define OF_DEBUG_GUEST_IO       0x00000010
++#define OF_DEBUG_GUEST_PIO      0x00000020
++#define OF_DEBUG_GUEST_MEM      0x00000040
++#define OF_DEBUG_GUEST_MEM_RW   0x00000080
++
++#define OF_DEBUG_X              0x00000100
++#define OF_DEBUG_FB             0x00000200
++#define OF_DEBUG_OPENGL         0x00000400
++#define OF_DEBUG_X2             0x00000800
++
++#define OF_FORCE_BIT            0x00001000
++#define OF_FORCE_PBO            0x00002000
++#define OF_FORCE_DIRTY          0x00004000
++#define OF_FORCE_SHTEX          0x00008000
++
++#define OF_DEBUG_PVA            0x00010000
++#define OF_DEBUG_PVA2           0x00020000
++#define OF_DEBUG_PVA3           0x00040000
++#define OF_DEBUG_RPC            0x00080000
++
++#define DPRINT(flags, fmt, ...) \
++    if (orc_flags & flags) \
++        fprintf(logfile, "%s: "fmt, __func__, ## __VA_ARGS__)

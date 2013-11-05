@@ -1,0 +1,22 @@
+diff --git a/hw/xen_machine_pv.c b/hw/xen_machine_pv.c
+index 3c20248..45965e5 100644
+--- a/hw/xen_machine_pv.c
++++ b/hw/xen_machine_pv.c
+@@ -29,6 +29,8 @@
+ #include "xen_domainbuild.h"
+ #include "blockdev.h"
+ 
++#define PV_MAX_VCPUS 32
++
+ static void xen_init_pv(QEMUMachineInitArgs *args)
+ {
+     const char *cpu_model = args->cpu_model;
+@@ -115,7 +117,7 @@ static QEMUMachine xenpv_machine = {
+     .name = "xenpv",
+     .desc = "Xen Para-virtualized PC",
+     .init = xen_init_pv,
+-    .max_cpus = 1,
++    .max_cpus = PV_MAX_VCPUS,
+     .default_machine_opts = "accel=xen",
+ };
+ 

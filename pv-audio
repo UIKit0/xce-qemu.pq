@@ -1,0 +1,1124 @@
+diff --git a/configure b/configure
+index 3f5cce0..5451322 100755
+--- a/configure
++++ b/configure
+@@ -124,6 +124,7 @@ audio_win_int=""
+ cc_i386=i386-pc-linux-gnu-gcc
+ libs_qga=""
+ debug_info="yes"
++pv_audio="yes"
+ 
+ # Don't accept a target_list environment variable.
+ unset target_list
+@@ -275,6 +276,10 @@ if test "$debug_info" = "yes"; then
+     LDFLAGS="-g $LDFLAGS"
+ fi
+ 
++if test "$pv_audio" = "yes"; then
++    LDFLAGS="$LDFLAGS -lpulse -lxenctrl"
++fi
++
+ # make source path absolute
+ source_path=`cd "$source_path"; pwd`
+ 
+diff --git a/hw/Makefile.objs b/hw/Makefile.objs
+index d581d8d..0dd4d22 100644
+--- a/hw/Makefile.objs
++++ b/hw/Makefile.objs
+@@ -138,6 +138,7 @@ common-obj-$(CONFIG_RC4030) += rc4030.o
+ common-obj-$(CONFIG_DP8393X) += dp8393x.o
+ common-obj-$(CONFIG_DS1225Y) += ds1225y.o
+ common-obj-$(CONFIG_MIPSNET) += mipsnet.o
++common-obj-$(CONFIG_VGA_PCI) += pvaudio.o
+ 
+ common-obj-y += null-machine.o
+ 
+diff --git a/hw/pc_piix.c b/hw/pc_piix.c
+index aa3e7f4..db9f499 100644
+--- a/hw/pc_piix.c
++++ b/hw/pc_piix.c
+@@ -50,6 +50,8 @@
+ 
+ #define MAX_IDE_BUS 2
+ 
++extern int pvaudio_init(PCIBus *bus);
++
+ static const int ide_iobase[MAX_IDE_BUS] = { 0x1f0, 0x170 };
+ static const int ide_iobase2[MAX_IDE_BUS] = { 0x3f6, 0x376 };
+ static const int ide_irq[MAX_IDE_BUS] = { 14, 15 };
+@@ -193,6 +195,9 @@ static void pc_init1(MemoryRegion *system_memory,
+     }
+ 
+     audio_init(isa_bus, pci_enabled ? pci_bus : NULL);
++    if (pci_enabled && xen_enabled()) {
++        pvaudio_init(pci_bus);	
++    }
+ 
+     pc_cmos_init(below_4g_mem_size, above_4g_mem_size, boot_device,
+                  floppy, idebus[0], idebus[1], rtc_state);
+diff --git a/hw/pvaudio.c b/hw/pvaudio.c
+new file mode 100644
+index 0000000..d75272d
+--- /dev/null
++++ b/hw/pvaudio.c
+@@ -0,0 +1,983 @@
++#include <signal.h>
++#include <string.h>
++#include <errno.h>
++#include <unistd.h>
++#include <assert.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <getopt.h>
++#include <fcntl.h>
++#include <locale.h>
++#include <math.h>
++#include <xenctrl.h>
++
++#include <sys/mman.h>
++#include <sys/prctl.h>
++#include <sys/time.h>
++#include <sys/resource.h>
++
++#include <pulse/pulseaudio.h>
++#include <pulse/mainloop.h>
++#include <pthread.h>
++
++#include <xen/hvm/hvm_op.h>
++
++#include "hw.h"
++#include "pci.h"
++#include "xen_common.h"
++#include "orc_debug.h"
++#include "orc_rpc.h"
++#include "audio/audio.h"
++#include "qemu-timer.h"
++
++#define ULONGLONG uint64_t
++#define LONGLONG int64_t
++#define ULONG uint32_t
++#define LONG int32_t
++#define UCHAR uint8_t
++
++#include "pvaudio.h"
++
++extern XenXC xen_xc;
++
++#ifdef CONFIG_VNC
++extern const char *vnc_display;
++#endif
++
++#define INCREMENT    (256)
++#define MS_STOP      (1000000000)
++#define MS_WD_PERIOD (1000000000)
++#define MS_WD_MAX    (160000000)
++
++//#define PV_AUDIO_DEBUG 1
++
++typedef struct _PVAudioState {
++    PCIDevice dev;
++    struct SHARED_MEM_REGION *shmem[2];
++    MemoryRegion ioregion;
++    int playback_state;
++    int capture_state;
++    int perma_mute;
++    size_t bytes_per_frame;
++    void *nulls;
++    unsigned long guest_page;
++    uint64_t playback_start_ts;
++    QEMUTimer *ts;
++    QEMUTimer *wd;
++    int64_t last_sample_time;
++} PVAudioState;
++
++static pa_context *context = NULL;
++static pa_stream *streams[2];
++static pa_mainloop_api *mainloop_api = NULL;
++static pa_threaded_mainloop* m = NULL;
++
++static const char *bname = NULL;
++
++static const pa_sample_spec in_sample_spec = {
++    .format = PA_SAMPLE_S16LE,
++    .rate = 44100,
++    .channels = 2
++};
++
++static const pa_sample_spec out_sample_spec = {
++    .format = PA_SAMPLE_S16LE,
++    .rate = 44100,
++    .channels = 2
++};
++
++static const pa_buffer_attr in_buffer_attr = {
++    .maxlength = (uint32_t) -1,
++    .tlength = (uint32_t) -1,
++    .prebuf = (uint32_t) -1,
++    .minreq = (uint32_t) -1,
++    .fragsize = (4096)
++};
++
++static const pa_buffer_attr out_buffer_attr = {
++    .maxlength = (uint32_t) -1,
++    .tlength = (1024 * 4 * 4),
++    .prebuf = 512,
++    .minreq = (uint32_t) -1,
++    .fragsize = 0
++};
++
++int ConsumerIndexNext = 0, ConsumerIndex = 0, ProducerIndex = 0;
++int64_t expectedPlaybackPosition = 0, gp_diff = 0;
++int gp_diff_target = -(8192 * 2);
++int my_count = 0, my_read_count = 0, write_soon = 0, timer_is_running = 0;
++int first_write_success = 0;
++static void context_state_callback(pa_context *c, void *userdata); 
++static void out_stream_state_callback(pa_stream *s, void *userdata);
++static int write_samples (pa_stream *s, size_t nbytes, void *userdata);
++static int read_samples (pa_stream *s, size_t nbytes, void *userdata);
++uint32_t start_pulse_client(PVAudioState *state); 
++static void stream_start(int direction, PVAudioState *state);
++static void stream_stop(int direction, PVAudioState *state);
++uint64_t get_nsec_now(void);
++static void __operation_unref(const char *f, int l, pa_operation *o) {
++    if (o)
++	pa_operation_unref(o);
++    else {
++	int err=pa_context_errno(context);
++	qemu_log("%s:%d:WARN: pa_operation_unref failed: %d: %s",f, l,
++		 err, pa_strerror(err));
++    }
++}
++
++#define operation_unref(o) __operation_unref(__FILE__, __LINE__, o)
++#define unref_cork(s,v,p) operation_unref(pa_stream_cork(s,v,p,NULL))
++#define unref_trigger(s) operation_unref(pa_stream_trigger(s,NULL,NULL))
++#define unref_flush(s) operation_unref(pa_stream_flush(s,NULL,NULL))
++
++static void update_shared_position(PVAudioState *state, int64_t gp, uint64_t ts)
++{
++    HEADER *header = &state->shmem[OUTPUT]->header;
++    
++    if (header == NULL)
++	return;
++
++    while (g_atomic_int_compare_and_exchange(&header->Lock, 0, 1) != TRUE)
++	;
++
++    header->GlobalPosition = gp;
++
++    header->Timestamp = ts;
++
++    header->Lock = 0;
++
++}
++
++/* Stream cork complete */
++static void stream_cork_complete(pa_stream*s, int success, void *userdata) {
++
++    if (!success) {
++        qemu_log("Failed to cork stream: %s", pa_strerror(pa_context_errno(context)));
++    }
++
++#ifdef PV_AUDIO_DEBUG
++    qemu_log("Playback stream corked.");
++#endif
++}
++
++
++static void audio_timer (void *opaque)
++{ 
++    PVAudioState *state = opaque;
++
++    pa_threaded_mainloop_lock(m);
++
++#ifdef PV_AUDIO_DEBUG
++    qemu_log ("timer");
++#endif
++    
++    if (state->playback_state == AUD_STOP)
++
++	if ((streams[OUTPUT] != NULL) &&
++	    !pa_stream_is_corked(streams[OUTPUT])) {
++	    unref_cork(streams[OUTPUT], 1, stream_cork_complete); 
++	}
++
++    timer_is_running = 0;
++
++    pa_threaded_mainloop_unlock(m);
++}
++
++static void connect_output_stream(PVAudioState *state)
++{
++    char name[64];
++    int ret;
++
++    snprintf(name, sizeof(name), "output stream #%i", xen_domid);
++    streams[OUTPUT] = pa_stream_new(context, name, &out_sample_spec, NULL);
++
++#ifdef PV_AUDIO_DEBUG
++    qemu_log( "Created output streams %p\n", streams[OUTPUT]);
++#endif
++    pa_stream_set_state_callback(streams[OUTPUT], out_stream_state_callback, (void*) state);
++    ret = pa_stream_connect_playback(streams[OUTPUT], NULL, &out_buffer_attr,
++				     PA_STREAM_START_CORKED |
++				     PA_STREAM_INTERPOLATE_TIMING |
++				     PA_STREAM_AUTO_TIMING_UPDATE,
++				     NULL, NULL);
++    if (ret < 0)
++	qemu_log ("pa_stream_connect_playback=%d", ret);
++}
++
++static void watch_dog (void *opaque)
++{ 
++    PVAudioState *state = opaque;
++    int ret;
++    int64_t now = qemu_get_clock_ns(vm_clock);
++
++#ifdef PV_AUDIO_DEBUG
++    qemu_log ("watch dog fired: state:%d now:%lld last_sample:%lld diff:%lld",
++	      state->playback_state, now, state->last_sample_time,
++	      now-state->last_sample_time);
++#endif
++
++    if (state->playback_state != AUD_STOP) {
++	if (now >= (state->last_sample_time + MS_WD_MAX)) {
++	    /* Haven't received callback to write_samples() for a long time */
++	    qemu_log ("BAD: watch dog acting");
++	    pa_threaded_mainloop_lock(m);
++
++	    if (streams[OUTPUT] != NULL) {
++		ret = pa_stream_disconnect(streams[OUTPUT]);
++		if (ret < 0)
++		    qemu_log ("pa_stream_disconnect=%d", ret);
++		connect_output_stream(state);
++	    }
++
++	    pa_threaded_mainloop_unlock(m);
++	} else {
++	    /* Restart timer */
++#ifdef PV_AUDIO_DEBUG
++	    qemu_log ("Scheduling timer for +%dns: now:%lld time:%lld",
++		      MS_WD_PERIOD, now, now + MS_WD_PERIOD);
++#endif
++	    qemu_mod_timer (state->wd, now + MS_WD_PERIOD);
++	}
++    }
++}
++
++static void *pvaudio_set_shmem_mapping(PVAudioState *state, uint32_t begin)
++{
++    ram_addr_t size;
++    void *ret_pointer = NULL;
++    unsigned long host_addr = begin;
++
++    /* align begin and end address */
++    begin = begin & XC_PAGE_MASK;
++
++    size = (((sizeof(SHARED_MEM_REGION) + AUDIO_DATA_BUFFER_SIZE) * 2) +
++	    XC_PAGE_SIZE - 1) & XC_PAGE_MASK;
++
++    ret_pointer = qemu_get_ram_ptr(host_addr);
++
++    if (xen_enabled())
++	(void)xc_domain_pin_memory_cacheattr(
++					     xen_xc, xen_domid,
++					     begin >> XC_PAGE_SHIFT,
++					     (begin + size) >> XC_PAGE_SHIFT,
++					     XEN_DOMCTL_MEM_CACHEATTR_WB);
++    
++    return ret_pointer;
++}
++
++static void pvaudio_unset_shmem_mapping(PVAudioState *state)
++{
++    qemu_put_ram_ptr(state->shmem[OUTPUT]);
++
++    return;
++}
++
++static void pvaudio_on_reset(void *opaque)
++{
++    PVAudioState *state = (PVAudioState *) opaque;
++
++    qemu_log("PV audio resetting.\n");
++    if (state->shmem[OUTPUT] && state->guest_page) {
++	pvaudio_unset_shmem_mapping(state);
++    }
++
++    state->shmem[OUTPUT] = NULL;
++    state->shmem[INPUT] = NULL;
++    state->guest_page = 0;
++
++#ifdef CONFIG_VNC
++    if (vnc_display) {
++	qemu_log("Muting PV Audio on VNC (NxPrep)\n");
++	state->perma_mute = 1;
++    }
++#endif
++
++    return;
++}
++
++static void pvaudio_iopw(void *opaque, pcibus_t addr, uint64_t val, unsigned size)
++{
++    PVAudioState *state = (PVAudioState *)opaque;
++    HEADER *header;
++    int64_t gp;
++    uint64_t ts;
++
++    if (val > 4 && state->shmem[OUTPUT] && state->guest_page) {
++	pvaudio_on_reset(state);
++    }
++
++    if (!state->shmem[OUTPUT]) {
++
++	if (val == 0)
++	    return;
++
++	qemu_log("domU requesting PV audio...");
++
++	state->shmem[OUTPUT] = pvaudio_set_shmem_mapping(state, val);
++
++	if (!state->shmem[OUTPUT]) {
++	    /* Mapping failed - bail!!! */
++	    qemu_log("Failed to map audio buffer. Disabling sound.");
++	    pvaudio_on_reset(state);
++
++	    return;
++	}
++	    
++	state->shmem[INPUT] = (void *)((unsigned long)state->shmem[OUTPUT] +
++				       sizeof(SHARED_MEM_REGION) +
++				       AUDIO_DATA_BUFFER_SIZE - 8);
++	state->guest_page = val;
++
++	header = &state->shmem[OUTPUT]->header;
++
++	/* Set Dom0 fields in header. NO OTHER FIELDS SHOULD BE TOUCHED */
++	header->Lock = 0;
++
++	state->playback_state = AUD_STOP;
++	state->capture_state = AUD_STOP;
++
++	if (start_pulse_client(state)) {
++	    qemu_log("PulseAudio initialization failed. Disabling sound.");
++	    pvaudio_on_reset(state);
++
++	    return;
++	}
++
++	state->ts = qemu_new_timer_ns (vm_clock, audio_timer, state);
++	if (!state->ts) {
++	    hw_error("Could not create audio timer\n");
++	}
++	
++	state->wd = qemu_new_timer_ns (vm_clock, watch_dog, state);
++	if (!state->wd) {
++	    hw_error("Could not create playback watch dog\n");
++	}
++
++	/* Tell guest we are ready */
++	header->Dom0Magic = DOM0_READY;
++
++	qemu_log("PV audio handshake complete.");
++    } else {
++
++	if (context == NULL) {
++	    header = &state->shmem[OUTPUT]->header;
++
++	    /* we will only try to reconnect to pulse if starting from stopped state */
++	    if ((header->State == AUD_STOP && state->playback_state != AUD_STOP) ||
++		(header->State == AUD_PAUSE && state->playback_state == AUD_STOP) ) {
++
++		header->Lock = 0;
++		if (start_pulse_client(state)) {
++		    qemu_log("PulseAudio new initialization failed. Disabling sound.");
++		    pvaudio_on_reset(state);
++		    return;
++		}
++	    } else {
++		return;
++	    }
++	}
++
++	pa_threaded_mainloop_lock(m);
++
++	header = &state->shmem[OUTPUT]->header;
++	switch(header->State) {
++	case AUD_STOP:
++	    if (state->playback_state != AUD_STOP) {
++		stream_stop(OUTPUT, state);
++		state->playback_state = AUD_STOP;
++	    }
++	    break;
++	case AUD_ACQUIRE:
++	case AUD_PAUSE:
++
++	    if (state->playback_state == AUD_RUN) {
++		ts = get_nsec_now();
++		gp = header->GlobalPosition + 
++		    (((ts - header->Timestamp)/1000) * 44100 * 4)/1000000;
++		header->Timestamp = ts;
++		
++		update_shared_position(state, gp, ts);
++
++		qemu_mod_timer (state->ts, qemu_get_clock_ns (vm_clock) + MS_STOP);
++		timer_is_running = 1;
++	    }
++
++	    state->playback_state = AUD_PAUSE;
++
++	    break;
++	case AUD_RUN:
++	    if (state->playback_state != AUD_RUN) {
++		// write_soon for some reason is not working as expected, leaving 
++		// here for some more work to be done.
++		//write_soon = 1;
++
++		state->playback_state = AUD_RUN;
++		state->last_sample_time = qemu_get_clock_ns(vm_clock);
++		qemu_mod_timer (state->wd, state->last_sample_time + MS_WD_PERIOD);
++
++		stream_start(OUTPUT, state);
++	    }
++	    break;
++	}
++
++#ifdef PV_AUDIO_DEBUG
++	qemu_log("STATUS %d: %d gp_diff:%d epp:%d ci:%6d pi:%6d pb:%d",
++		 header->State, my_count, gp_diff, 
++		 expectedPlaybackPosition,
++		 header->ConsumerIndex, header->ProducerIndex, header->ProcessedBytes);
++#endif
++
++	header = &state->shmem[INPUT]->header;
++	switch(header->State) {
++	case AUD_STOP:
++	    if (state->capture_state != AUD_STOP) {
++		stream_stop(INPUT, state);
++		state->capture_state = AUD_STOP;
++	    }
++	    break;
++	case AUD_ACQUIRE:
++	case AUD_PAUSE:
++	    break;
++	case AUD_RUN:
++	    if (state->capture_state != AUD_RUN) {
++		stream_start(INPUT, state);
++		state->capture_state = AUD_RUN;
++	    }
++	    break;
++	}
++
++	pa_threaded_mainloop_unlock(m);
++    }
++}
++
++uint64_t get_nsec_now(void)
++{
++    uint64_t now;
++    xc_hvm_get_time(xen_xc, &now);
++    return now;
++}
++
++static void scale_pcm_volume(uint32_t percentage, void *data, uint32_t bps, uint32_t count)
++{
++    int i;
++    double scale = 1 - (log10(100-percentage) / 2);
++    switch (bps) {
++    case 8: {
++	uint8_t *samples = data;
++	for (i = 0; i < count; i++) {
++	    int16_t sample = (samples[i] - 0x80);
++	    sample *= scale;
++	    samples[i] = sample + 0x80;
++	}
++    } break;
++	
++    case 16: {
++	int16_t *samples = data;
++	for (i = 0; i < count; i++)
++	    samples[i] *= scale;
++    } break;
++    }
++}
++
++
++static void pa_write_silence(int nbytes)
++{
++    int i;
++    uint8_t *tmp_buf;
++
++    tmp_buf = malloc(nbytes);
++    for( i=0; i<nbytes; i++ ) {
++        tmp_buf[i] = 0;
++    }
++
++    pa_stream_write(streams[0], tmp_buf, nbytes,
++		    NULL, 0 , PA_SEEK_RELATIVE);
++
++    free(tmp_buf);
++#ifdef PV_AUDIO_DEBUG
++    qemu_log("played %d bytes of silence", nbytes);
++#endif
++}
++
++static int write_samples (pa_stream *s, size_t nbytes, void *userdata)
++{
++    PVAudioState *state = (PVAudioState *)userdata;
++    HEADER *header;
++    uint8_t *data;
++    int is_good = 0;
++    int negative; 
++    pa_usec_t r_usec;
++    int64_t gp;
++    uint64_t bytes_displacement;
++    int nbytes_orig = nbytes;
++    int avail_bytes;
++    uint64_t ts;
++    int64_t pulse_position;
++
++    state->last_sample_time = qemu_get_clock_ns(vm_clock);
++
++    /* bail early if shared memory not set */
++    if (!state->shmem[OUTPUT]) {
++        qemu_log("ERROR: PV audio shared memory not set\n");
++        return 0;
++    }
++
++    header = &state->shmem[OUTPUT]->header;
++    data = state->shmem[OUTPUT]->Data;
++
++    /* bail early to avoid a divide by zero */
++    if (!header->BufferSize) {
++        qemu_log("ERROR: PV audio header buffer size 0\n");
++        return 0;
++    }
++
++    ConsumerIndex = header->ConsumerIndex;
++    ProducerIndex = header->ProducerIndex;
++
++    if (ProducerIndex - ConsumerIndex >= 0)
++	avail_bytes = ProducerIndex - ConsumerIndex;
++    else
++	avail_bytes = ProducerIndex + header->BufferSize - ConsumerIndex;
++
++    if (avail_bytes < nbytes) {
++	nbytes = avail_bytes;
++    } 
++    
++    ConsumerIndexNext = (ConsumerIndex + nbytes) % header->BufferSize;
++    
++    if (ConsumerIndex + nbytes >= header->BufferSize) {
++    	// we are cycling
++    	if (ConsumerIndex > ProducerIndex &&
++    	    ConsumerIndexNext <= ProducerIndex) {
++    	    is_good = 1;
++    	}
++    } else {
++    	if (ConsumerIndex < ProducerIndex &&
++    	    ConsumerIndexNext <= ProducerIndex) {
++    	    is_good = 1;
++    	}
++    	if (ConsumerIndex > ProducerIndex &&
++    	    ConsumerIndexNext > ProducerIndex) {
++    	    is_good = 1;
++    	}
++    }
++    
++    if (state->playback_state == AUD_RUN) {
++	if (is_good == 1) {
++	    if (state->perma_mute == 0 && header->MuteControls[0] == 0) {
++
++		if (ConsumerIndex + nbytes <= header->BufferSize) {
++		    if (header->VolumeControls[0] != 100)
++			scale_pcm_volume(header->VolumeControls[0], &data[header->ConsumerIndex],
++					 header->BitsPerSample, nbytes/2);
++		    
++		    pa_stream_write(s, &data[header->ConsumerIndex], nbytes,
++				    NULL, 0 , PA_SEEK_RELATIVE);		    
++		} else {
++		    if (header->VolumeControls[0] != 100) {
++			scale_pcm_volume(header->VolumeControls[0], &data[header->ConsumerIndex],
++					 header->BitsPerSample, 
++					 (header->BufferSize - ConsumerIndex)/2);
++			scale_pcm_volume(header->VolumeControls[0], &data[0],
++					 header->BitsPerSample, 
++					 ((ConsumerIndex + nbytes) % header->BufferSize)/2);
++		    }
++		    
++		    
++		    pa_stream_write(s, &data[header->ConsumerIndex], 
++				    header->BufferSize - ConsumerIndex,
++				    NULL, 0 , PA_SEEK_RELATIVE);
++		    
++		    pa_stream_write(s, &data[0], (ConsumerIndex + nbytes) % header->BufferSize,
++				    NULL, 0 , PA_SEEK_RELATIVE);
++		}
++	    } else {
++#ifdef PV_AUDIO_DEBUG
++		qemu_log("Muted!!");
++#endif
++		pa_write_silence(nbytes);
++	    }
++	    
++	} else {
++	    pa_write_silence(nbytes_orig);
++	}
++
++	// update ConsumerIndex
++
++	header->ConsumerIndex =  (header->ConsumerIndex + nbytes) % header->BufferSize;
++		
++	// update shared position and timestamp
++		
++	pa_stream_get_latency (s, &r_usec, &negative);
++	
++	header->ProcessedBytes += nbytes;
++	bytes_displacement = (r_usec * 44100 * 4)/1000000;
++	
++	pulse_position = (int64_t)header->ProcessedBytes - (int64_t)bytes_displacement;
++	ts = get_nsec_now();
++
++	expectedPlaybackPosition = header->GlobalPosition + 
++	    (((ts - header->Timestamp)/1000) * 44100 * 4)/1000000;
++	
++	if (((ts - state->playback_start_ts)/1000000) > 80) {
++	    if (gp_diff == 0) {
++		gp_diff = pulse_position - expectedPlaybackPosition;
++	    } else {
++		if (gp_diff < (gp_diff_target - (INCREMENT + 1)))
++		    gp_diff += INCREMENT;
++		else if (gp_diff > (gp_diff_target + (INCREMENT + 1)))
++		    gp_diff -= INCREMENT;
++	    }
++	    gp = pulse_position - gp_diff;
++	} else {
++	    gp = expectedPlaybackPosition;
++	}
++
++#ifdef PV_AUDIO_DEBUG
++	qemu_log("PLAY: %d ms:%6d pp:%d gp_diff:%d epp:%d gp:%d ci:%6d pi:%6d pb:%d nb:%5d rus:%6d",
++		 my_count, (ts - header->Timestamp)/1000,
++		 pulse_position, gp_diff, expectedPlaybackPosition, gp,
++		 header->ConsumerIndex, header->ProducerIndex, header->ProcessedBytes,
++		 nbytes, r_usec);
++#endif
++	update_shared_position(state, gp, ts);
++
++    } else {
++	pa_write_silence(nbytes_orig);
++    }
++
++    return 0;
++}
++
++static int read_samples (pa_stream *s, size_t tot_nbytes, void *userdata)
++{
++    PVAudioState *state = (PVAudioState *)userdata;
++    HEADER *header;
++    uint8_t *data;
++    uint8_t *data_from; 
++    size_t nbytes;
++    
++    header = &state->shmem[INPUT]->header;
++    data = state->shmem[INPUT]->Data;
++    
++    for (;;) {
++	
++	nbytes = pa_stream_readable_size(s);
++	
++	if (nbytes <= 0)
++	    break;
++	
++	pa_stream_peek ( s, (const void **)&data_from, &nbytes);
++	
++	if (header->State == AUD_RUN) {
++	    
++	    if (data_from != NULL) {
++		
++		if (header->ProducerIndex + nbytes <= header->BufferSize) {
++		    memcpy(&data[header->ProducerIndex], data_from, nbytes);
++		} else {
++		    memcpy(&data[header->ProducerIndex], 
++			   data_from, 
++			   header->BufferSize - header->ProducerIndex);
++		    
++		    memcpy(&data[0], 
++			   &data_from[header->BufferSize - header->ProducerIndex], 
++			   (header->ProducerIndex + nbytes) % header->BufferSize);
++		}
++		
++		header->ProducerIndex =  (header->ProducerIndex + nbytes) % header->BufferSize;    
++	    }      
++	}
++	pa_stream_drop(s);
++	
++	tot_nbytes -= nbytes;
++    }
++
++    return 0;
++}
++
++static void underflow_cb(struct pa_stream *s, void *userdata) {
++    qemu_log("pv audio: underflow_cb");
++}
++
++uint64_t last_write_time, last_read_time;
++
++static void my_write_cb(pa_stream *s, size_t nbytes, void *userdata)
++{
++    write_samples(s, nbytes, userdata);    
++    my_count++;
++}
++
++
++static void my_read_cb(pa_stream *s, size_t nbytes, void *userdata)
++{
++    read_samples(s, nbytes, userdata);
++    my_read_count++;
++}
++
++
++/* This routine is called whenever the stream state changes */
++static void out_stream_state_callback(pa_stream *s, void *userdata) {
++    PVAudioState *state = userdata;
++    if (s == NULL) {
++	qemu_log( "pv audio (out_stream_state_callback): Out Stream is NULL\n");
++	return;
++    }
++#ifdef PV_AUDIO_DEBUG
++    qemu_log( "OUT stream state: %d  s:0x%x", pa_stream_get_state(s), s);
++#endif
++    switch (pa_stream_get_state(s)) {
++    case PA_STREAM_UNCONNECTED:
++    case PA_STREAM_CREATING:
++    case PA_STREAM_TERMINATED:
++	break;
++
++    case PA_STREAM_READY: {
++	/* Be notified when this stream is drained */
++	pa_stream_set_underflow_callback(s, underflow_cb, userdata);
++	pa_stream_set_write_callback (s, my_write_cb, userdata);
++	if (state->playback_state != AUD_STOP && pa_stream_is_corked(streams[OUTPUT])) {
++	    unref_cork(streams[OUTPUT], 0, stream_cork_complete); 
++	    pa_stream_trigger(streams[OUTPUT], NULL, NULL);
++	}
++ 
++	break;
++    }
++
++    default:
++    case PA_STREAM_FAILED:
++	qemu_log( "Stream error: %s\n", pa_strerror(pa_context_errno(pa_stream_get_context(s))));
++	streams[OUTPUT] = NULL;
++    }
++}
++
++/* This routine is called whenever the stream state changes */
++static void in_stream_state_callback(pa_stream *s, void *userdata) {
++    if (s == NULL) {
++	qemu_log( "pv audio (in_stream_state_callback): In Stream is NULL\n");
++	return;
++    }
++
++    switch (pa_stream_get_state(s)) {
++    case PA_STREAM_UNCONNECTED:
++    case PA_STREAM_CREATING:
++    case PA_STREAM_TERMINATED:
++	break;
++
++    case PA_STREAM_READY: {	
++	pa_stream_set_read_callback (s, my_read_cb, userdata); 
++	break;
++    }
++
++    default:
++    case PA_STREAM_FAILED:
++	qemu_log( "Stream error: %s\n", pa_strerror(pa_context_errno(pa_stream_get_context(s))));
++	streams[INPUT] = NULL;
++    }
++}
++
++/* This is called whenever the context status changes */
++static void context_state_callback(pa_context *c, void *userdata) {
++    if (c == NULL) {
++        qemu_log( "pv audio (context_state_callback): Context is NULL\n");
++        return;
++    }
++#ifdef PV_AUDIO_DEBUG
++    qemu_log( "CONTEXT_STATE: %d", pa_context_get_state(c));
++#endif
++    switch (pa_context_get_state(c)) {
++    case PA_CONTEXT_CONNECTING:
++    case PA_CONTEXT_AUTHORIZING:
++    case PA_CONTEXT_SETTING_NAME:
++	break;
++
++    case PA_CONTEXT_READY: {
++	qemu_log( "Connection established.\n");
++
++	qemu_log( "Creating streams\n");
++
++	// output stream
++	connect_output_stream(userdata);
++
++	// input stream
++	char name[64];
++	snprintf(name, sizeof(name), "input stream #%i", xen_domid);
++	streams[INPUT] = pa_stream_new(c, name, &in_sample_spec, NULL);
++	qemu_log( "Created input streams %p\n", streams[INPUT]);
++	pa_stream_set_state_callback(streams[INPUT], in_stream_state_callback, (void*) userdata);
++	pa_stream_connect_record(streams[INPUT], NULL, &in_buffer_attr,
++				 PA_STREAM_START_CORKED |
++				 PA_STREAM_INTERPOLATE_TIMING |
++				 PA_STREAM_AUTO_TIMING_UPDATE);
++
++	qemu_log( "Creating streams done\n");
++	
++	break;
++    }
++
++    case PA_CONTEXT_TERMINATED:
++    case PA_CONTEXT_FAILED:
++    default:
++	qemu_log( "Context failed error: %s\n", pa_strerror(pa_context_errno(c)));
++	mainloop_api->quit(mainloop_api, 0);
++	streams[OUTPUT] = NULL;
++	streams[INPUT] = NULL;
++	context = NULL;
++    }
++}
++
++uint32_t start_pulse_client(PVAudioState *state) 
++{
++    /* Set up a new main loop */
++    m = pa_threaded_mainloop_new();
++    if (m == NULL) {
++	qemu_log( "pa_threaded_mainloop_new() failed.\n");
++	return -1;
++    }
++
++    mainloop_api = pa_threaded_mainloop_get_api(m);
++    if (mainloop_api == NULL) {
++	qemu_log( "pa_threaded_mainloop_get_api() failed.\n");
++	return -2;
++    }
++
++    context = pa_context_new(mainloop_api, bname);
++    if (context == NULL) {
++	qemu_log( "pa_context_bew() failed.\n");
++	return -3;
++    }
++
++    pa_context_set_state_callback(context, context_state_callback, state);
++
++    /* Connect the context */
++    if (pa_context_connect(context, NULL, 0, NULL) < 0) {
++	qemu_log( "pa_context_connect() failed.\n");
++	return -4;
++    }
++
++    if (pa_threaded_mainloop_start(m) < 0)
++	qemu_log( "pa_mainloop_run() failed.\n");
++
++    return 0;
++}
++
++
++static void stream_start(int direction, PVAudioState *state)
++{
++    if (direction == OUTPUT) {
++	HEADER *header = &state->shmem[OUTPUT]->header;
++	if (header != NULL) {
++	    header->Lock = 0;
++	    state->playback_start_ts = get_nsec_now();
++	    header->Timestamp = state->playback_start_ts;
++	    gp_diff = 0;
++	}
++	my_count = 0;
++	first_write_success = 0;
++	if (streams[OUTPUT] != NULL && pa_stream_is_corked(streams[OUTPUT])) {
++	    unref_cork(streams[OUTPUT], 0, NULL);
++	    unref_trigger(streams[OUTPUT]);
++	}
++    } else {
++	my_read_count = 0;
++	if (streams[INPUT] != NULL) {
++	    unref_cork(streams[INPUT], 0, NULL);	
++	}
++    }
++}
++
++static void stream_stop(int direction, PVAudioState *state)
++{
++    if (direction == OUTPUT) {
++	HEADER *header = &state->shmem[OUTPUT]->header;
++	if (header != NULL) {
++	    header->Lock = 0;
++	    header->GlobalPosition = 0;
++	    header->ProcessedBytes = 0;
++	}
++	if (streams[OUTPUT] != NULL) {
++	    qemu_mod_timer (state->ts, qemu_get_clock_ns (vm_clock) + MS_STOP);
++	    timer_is_running = 1;
++	} 
++    } else {
++	if (streams[INPUT] != NULL) {
++	    unref_cork(streams[INPUT], 1, NULL);
++	    unref_flush(streams[INPUT]); 
++	}
++    }
++}
++
++static MemoryRegionOps ops = {
++    .write = pvaudio_iopw,
++};
++
++static int pvaudio_initfn(PCIDevice *dev)
++{
++    PVAudioState *state = (PVAudioState *)dev;
++    uint8_t *c;
++
++    c = state->dev.config;
++    c[0x00] = 0x34;      /* Bochs ID */
++    c[0x01] = 0x12;
++
++    c[0x02] = 0x12;	 /* 1234/1112 */
++    c[0x03] = 0x11;
++
++    c[0x04] = 0x00;      /* Command */
++    c[0x05] = 0x00;
++
++    c[0x06] = 0x80;      /* Status */
++    c[0x07] = 0x02;
++
++    c[0x08] = 0x01;      /* Revision */
++    c[0x09] = 0x00;      /* Prog IF */
++    c[0x0a] = 0x01;      /* Subclass (Audio Device) */
++    c[0x0b] = 0x04;      /* Class (Multimedia) */
++
++    c[0x0e] = 0x00;      /* Header type */
++
++    c[0x10] = 0x95;      /* BAR #1 - I/O Port for SHMEM */
++    c[0x11] = 0xff;      /* (Default 0xFF94) */
++    c[0x12] = 0x00;
++    c[0x13] = 0x00;
++
++    c[0x2c] = 0x01;      /* Subsystem vendor id */
++    c[0x2d] = 0x12;
++
++    c[0x3c] = 0x00;      /* Interrupt line */
++    c[0x3d] = 0x00;      /* Interrupt pin */
++
++    memory_region_init_io(&state->ioregion, &ops, &state->dev,
++                          "pv-audio-ioport", 4);
++
++    pci_register_bar (&state->dev, 0, PCI_BASE_ADDRESS_SPACE_IO,
++                      &state->ioregion);
++    qemu_register_reset (pvaudio_on_reset, state);
++    pvaudio_on_reset (state);
++
++    return 0;
++}
++
++static void pvaudio_class_init(ObjectClass *klass, void *data)
++{
++    PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
++
++    k->no_hotplug = 1;
++    k->init       = pvaudio_initfn;
++    k->vendor_id  = PCI_VENDOR_ID_QEMU;
++    k->device_id  = 0x1112;
++    k->class_id   = 0x0401;
++}
++
++static TypeInfo pvaudio_info = {
++    .name          = "ORC-AUDIO",
++    .parent        = TYPE_PCI_DEVICE,
++    .instance_size = sizeof(PVAudioState),
++    .class_init    = pvaudio_class_init,
++};
++
++DeviceState *pvaudio_init(PCIBus *bus)
++{
++    type_register_static(&pvaudio_info);
++    return &pci_create_simple(bus, -1, "ORC-AUDIO")->qdev;
++}
+diff --git a/hw/pvaudio.h b/hw/pvaudio.h
+new file mode 100644
+index 0000000..662400c
+--- /dev/null
++++ b/hw/pvaudio.h
+@@ -0,0 +1,71 @@
++#ifndef __PVASH_h__
++#define __PVASH_h__
++
++DeviceState *pvaudio_init(PCIBus *bus);
++
++typedef enum
++{
++    AUD_STOP,    // initial and terminal state no configured data stream
++    AUD_ACQUIRE, // configuring hardware
++    AUD_PAUSE,   // configured and paused
++    AUD_RUN      // operational state
++} AUD_STATE;
++
++#define AUDIO_DATA_BUFFER_SIZE 0x3f000 //(4096 * 2 * 16) // or whatever works
++
++#define CAPTURE_STREAM 0  // input audio
++#define RENDER_STREAM  1  // output audio
++#define MAX_CHANNELS   2  // preliminary
++#define MAX_STREAMS    2  // preliminary (n.b. there are MAX_STREAMS SHARED_MEM_REGIONS)
++#define DOM0_READY     0xDEADBEF0
++
++#define GUEST_PAGE_SIZE 4096
++
++typedef struct HEADER
++{
++    // These fields are Written Once by DOMU
++    volatile ULONG HeaderBytes; // size of this header version
++    volatile ULONG BufferSize;  // size of the data buffer
++    ULONG Dom0Magic;   // set to 0xdeadbeef when DOM0 is ready for action
++    ULONG StreamType;  // CAPTURE_STREAM or RENDER_STREAM
++
++    // These fields are DOMU Write Only.
++    volatile AUD_STATE  State;  // written by DOMU read by DOM0
++    volatile ULONG Format;      // 1 == PCM (only type currently supported)
++    volatile ULONG Channels;
++    volatile ULONG SamplesPerSec;
++    volatile ULONG AvgBytesPerSec;
++    volatile ULONG BlockAlign;
++    volatile ULONG BitsPerSample;    
++    //
++    // Mixer support
++    //
++    volatile LONG  VolumeControls[MAX_CHANNELS];
++    volatile LONG  MuteControls[MAX_CHANNELS];
++
++    // These fields are Written by the producer or consumer based on StreamType
++    volatile ULONG ProducerIndex; // RENDER: DOMU Writes CAPTURE: DOM0 Writes
++    volatile ULONG ConsumerIndex; // RENDER: DOM0 Writes CAPTURE: DOMU Writes
++  
++    // these fields are for time/position tracking
++    volatile LONGLONG GlobalPosition;
++    volatile ULONGLONG Timestamp;
++    volatile ULONGLONG ProcessedBytes;
++    volatile LONG Lock;
++
++} HEADER;
++
++typedef struct SHARED_MEM_REGION
++{
++    union 
++    {
++        HEADER header;
++        UCHAR page[GUEST_PAGE_SIZE];
++    };
++    UCHAR Data[8]; // buffer extends from here. 8 aligns the structure.
++} SHARED_MEM_REGION;
++
++#define OUTPUT 0
++#define INPUT 1
++
++#endif

@@ -1,0 +1,33 @@
+diff --git a/hw/ide/core.c b/hw/ide/core.c
+index 44b8df0..96833ee 100644
+--- a/hw/ide/core.c
++++ b/hw/ide/core.c
+@@ -830,13 +830,16 @@ static void ide_cd_change_cb(void *opaque, bool load)
+     s->nb_sectors = nb_sectors;
+ 
+     /*
+-     * First indicate to the guest that a CD has been removed.  That's
+-     * done on the next command the guest sends us.
++     * If not already processing a change, first indicate to the guest that
++     * a CD has been removed.  That's done on the next command the guest
++     * sends us.
+      *
+      * Then we set UNIT_ATTENTION, by which the guest will
+      * detect a new CD in the drive.  See ide_atapi_cmd() for details.
+      */
+-    s->cdrom_changed = 1;
++    if (s->cdrom_changed == 0)
++	    s->cdrom_changed = 1;
++
+     s->events.new_media = true;
+     s->events.eject_request = false;
+     ide_set_irq(s->bus);
+@@ -1840,7 +1843,7 @@ static void ide_reset(IDEState *s)
+     /* ATAPI specific */
+     s->sense_key = 0;
+     s->asc = 0;
+-    s->cdrom_changed = 0;
++    s->cdrom_changed = 2; /* Init so first CD attach causes 1 error */
+     s->packet_transfer_size = 0;
+     s->elementary_transfer_size = 0;
+     s->io_buffer_index = 0;

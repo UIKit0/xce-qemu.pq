@@ -1,0 +1,20 @@
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index 3c5bbb1..9150724 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -112,6 +112,7 @@ static void orc_vga_map(PCIDevice *pci_dev,
+     memory_region_add_subregion_overlap(r->address_space, r->addr, r->memory, 1);
+ 
+     s->vram_ptr = memory_region_get_ram_ptr(r->memory);
++    memset(s->vram_ptr, 0, size);
+ 
+     vga_dirty_log_start(s);
+     o->foreign_fb_initialized = 1;
+@@ -149,7 +150,6 @@ static void orc_vga_write_config(PCIDevice *d,
+                 orc_vga_map(d, bar_addr, vga_ram_size());
+ 
+             if (po->foreign_fb_initialized) {
+-                memset(s->vram_ptr, 0, vga_ram_size());
+                 vcp = GET_VCP((uint8_t *)s->vram_ptr);
+                 memcpy(vcp->supported_modes, orc_supported_modes, sizeof(orc_supported_modes));
+                 vcp->host_magic = ORC_VGA_MAGIC;

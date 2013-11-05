@@ -1,0 +1,32 @@
+diff --git a/console.h b/console.h
+index 83ea470..2177159 100644
+--- a/console.h
++++ b/console.h
+@@ -9,6 +9,7 @@
+ #include "trace.h"
+ #include "qapi-types.h"
+ #include "error.h"
++#include "sysemu.h"
+ 
+ /* keyboard/mouse support */
+ 
+@@ -216,6 +217,7 @@ typedef void (*display_hw_thumbnail_dump_ptr)(void *, const char *);
+ 
+ struct DisplayState {
+     struct DisplaySurface *surface;
++    DisplayType display_type;
+     void *opaque;
+     struct QEMUTimer *gui_timer;
+     bool have_gfx;
+diff --git a/vl.c b/vl.c
+index ab55dc5..ce3b729 100644
+--- a/vl.c
++++ b/vl.c
+@@ -4020,6 +4020,7 @@ int main(int argc, char **argv, char **envp)
+ #endif
+     }
+ 
++    ds->display_type = display_type;
+ 
+     /* init local displays */
+     switch (display_type) {

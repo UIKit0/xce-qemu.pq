@@ -1,0 +1,60 @@
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index 439c683..10a5ad4 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -30,6 +30,7 @@
+ #include "pixel_ops.h"
+ #include "qemu-timer.h"
+ #include "loader.h"
++#include "exec-memory.h"
+ #include "xen_backend.h"
+ #include "orc_debug.h"
+ #include "range.h"
+@@ -50,6 +51,7 @@ typedef struct ORCVGAState {
+     bool           color_cursor;
+     
+     bool           foreign_fb_initialized;
++    bool           rom_mapped;
+ 
+     uint8_t        num_displays;
+ } ORCVGAState;
+@@ -123,6 +125,7 @@ static void orc_vga_write_config(PCIDevice *d,
+     int i, was_irq_disabled = pci_get_word(d->config + PCI_COMMAND) * PCI_COMMAND_INTX_DISABLE;
+     pcibus_t orig_val = val;
+     DisplayState *ds = NULL;
++    ORCVGAState *po = DO_UPCAST(ORCVGAState, dev, d);
+ 
+     qemu_log("%s: addr = 0x%8x val = 0x%8x len = %x\n", __FUNCTION__, address, val, len);
+ 
+@@ -136,7 +139,6 @@ static void orc_vga_write_config(PCIDevice *d,
+ 
+     if (ranges_overlap(address, len, PCI_BASE_ADDRESS_0, 24)) {
+         pcibus_t bar_addr;
+-        ORCVGAState *po = DO_UPCAST(ORCVGAState, dev, d);
+         VGACommonState *s = &po->vga;
+         vga_control_page_t *vcp = NULL;
+ 
+@@ -161,6 +163,15 @@ static void orc_vga_write_config(PCIDevice *d,
+             break;
+         }
+         return;
++    } else if (ranges_overlap(address, len, PCI_ROM_ADDRESS, 4)) {
++        /* Provide ROM for SeaBIOS */
++        if (orig_val != 0xFFFFFFFF && orig_val != 0) {
++            if (po->rom_mapped) {
++                memory_region_del_subregion(get_system_memory(), &d->rom);
++            }
++            memory_region_add_subregion(get_system_memory(), orig_val & 0xFFFFFF00, &d->rom);
++            po->rom_mapped = TRUE;
++        }
+     }
+ 
+     if (range_covers_byte(address, len, PCI_COMMAND))
+@@ -736,6 +747,7 @@ static void orc_vga_class_init(ObjectClass *klass, void *data)
+     k->device_id = PCI_DEVICE_ID_QEMU_VGA;
+     k->class_id = PCI_CLASS_DISPLAY_VGA;
+     k->config_write = orc_vga_write_config;
++    k->romfile = "VGABIOS-lgpl-latest.orcvbe.bin";
+     dc->vmsd = &vmstate_vga_orc;
+ }
+ 

@@ -1,0 +1,78 @@
+orc_debug                          # Defines the DPRINT macro and flags for mepd-controlled dynamic debugging
+main_spin_debugging                # Causes qemu to spin waiting for gdb if /etc/nxtop/main_spin exists
+disconnect_devices                 # Removes emulated IDE and network devices from the bus when the guest writes a magic IO port
+qemu_rpc                           # QEMU participation in orccomm RPCs
+orc_cmdline_options                # Defines the orc_flags command line option
+capslock_hook                      # Adds a getter for the emulated keyboard capslock state
+syslog                             # Redirects all stderr output to syslog using fopen_cookie
+xen-ram-free                       # Utility function for reducing domU memory reservation
+no-mapcache                        # Disables the xen mapcache and maps all VM memory at boot time
+ram-alloc-at-phys                  # Adds the ability to allocate a region backed by real memory at a specific gpfn
+#dirty-page-tracking               # Support for multiple dirty page tracking regions - Doesn't work with Xen 4.3 yet
+variable-vram-size                 # User configurable VGA RAM size
+dpy_lock                           # Defines dpy_lock/unlock to allow for threaded UIs
+pv-audio                           # XCE PV Audio Backend
+orc-config                         # Change compile and runtime defaults (eg: FDD, parallel port)
+piix4_acpi                         # XXX: Evaluate if this is necessary anymore with Xen 4.2
+fix_1366_resolution                # Remove assumption that horizontal resolutions are multiples of 4 bytes wide
+orc-bios-init                      # XXX: Remove with move to seabios
+battery                            # Emulated battery device with state from Xenstore
+#fw_cfg_for_dynamic_srat           # Provide an SRAT to domU - Disabled for now 
+pv-xen-maxcpus                     # Don't bail if pv guests have -cpus >1
+enable-hvm-debug-port              # Print hvmloader/BOCHS BIOS debug output to syslog
+rtc-offset-tracking                # Write RTC updates into xenstore for persistence
+#no-hvmloader                      # Prototype patch for starting HVM domUs with no hvmloader
+slirp-fix                          # Fix upstream bug that prevents building with SLIRP disabled
+no-rtl8139-rom                     # Don't waste memory loading an option ROM that hvmloader doesn't use
+suppress-deprecated-warnings       # Build with -Wno-deprecated-declarations
+disable-open-by-handle             # Fix upstream bug that prevents building without open-by-handle
+cursor-locking                     # Locking in cursor.c functions to support multithreaded UIs
+support-paletted-shared-modes      # Allow paletted VGA modes to use a shared buffer
+hw-set-resolution-vector           # Multi-monitor support: Allow UIs to request resolution changes
+pci-bar-address-not-static         # Remove static scope from pci_bar_address (used in vga-orc)
+move-PCIVGAState-to-vga-int        # Make PCIVGAState accessible to more than just vga-pci.c for other PCI compatible VGA hw
+gui_start_updates                  # Multi-monitor support: Allow UIs to start gui updates on additional displays
+implement-display_hw_update        # Multi-monitor support: Screen refresh for non-VGA displays
+edid-vector                        # Multi-monitor support: Allow UIs to specify EDIDs
+DisplayType-per-DisplayState       # Multi-monitor support: Allow each DisplayState to have a different DisplayType
+display-id-allocation              # Multi-monitor support: Assign display IDs out of a sparse list
+add_display_ptr                    # Multi-monitor support: add_display vector for UIs to hotplug displays into hw
+display-hw-notify                  # Multi-monitor support: hw_notify vector for UIs to notify hw of configuration changes
+vga-orc                            # The XCE extended multi-monitor PCI video adapter
+always-allow-vga-port-0x3da        # XXX: What is this for, and do we still need it?
+more-fdc-disable
+kb-trace                           # Emulated keyboard debugging
+display-server-support             # UI for displaying through the XCE DisplayServer
+no-add_to_physmap
+revert-ide-busy-status             # Remove IDE Busy status because BOCHS BIOS doesn't support it - Remove on move to seabios
+#ioreq-server                      # Ported from XT
+acpi_tables_in_fw_cfg
+bios-signature
+fix-4g-vms
+disable-pc-speaker
+CONFIG_FDC-fixes
+#xengt
+move-dcl-stuf-even-farther-up
+fix-dpy_cursor_enable-to-fold
+update-dpy_reset-calls-to-fold
+remove-target-phys-addr-t
+fix-ram-alloc-at-phys
+wddm-dirty-rectangles              # Add dirty rectangle list support to vga-orc for WDDM and xorg domUs 
+cdrom-boot                         # NXT-10630: Remove this when we move to seabios
+vgabios-ddc                        # Support the XCE vgabios DDC2 implementation
+vga-orc-option-rom
+displayserver.xgt2
+serial-setup
+ensure_layout_updates
+suppress-faux-vsync
+ahci-disconnect-devices
+rs232-dtr-dsr-flow-control
+dont_paint_before_mode_is_set
+dont_clear_fb_on_base_addr_write
+suppress-jit-debug-descriptor
+fix-guest-logging-to-fold
+cursor-size-unsigned               # Fix overflow of signed cursor size - fold to vga-orc
+map_all_of_VRAM_in_DS
+vga-orc-xenstore-attached-leaf
+debugcon-filter-invalid-chars
+detect-invalid-monochrome-cursor

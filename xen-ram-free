@@ -1,0 +1,50 @@
+diff --git a/hw/xen.h b/hw/xen.h
+index e3cca7f..f78fe79 100644
+--- a/hw/xen.h
++++ b/hw/xen.h
+@@ -49,6 +49,7 @@ void xenstore_store_pv_console_info(int i, struct CharDriverState *chr);
+ struct MemoryRegion;
+ void xen_ram_alloc(ram_addr_t ram_addr, ram_addr_t size,
+                    struct MemoryRegion *mr);
++void xen_ram_free(ram_addr_t ram_addr, ram_addr_t size);
+ void xen_modified_memory(ram_addr_t start, ram_addr_t length);
+ #endif
+ 
+diff --git a/xen-all.c b/xen-all.c
+index af9e754..0efd55e 100644
+--- a/xen-all.c
++++ b/xen-all.c
+@@ -231,6 +231,33 @@ void xen_ram_alloc(ram_addr_t ram_addr, ram_addr_t size, MemoryRegion *mr)
+     g_free(pfn_list);
+ }
+ 
++void xen_ram_free(ram_addr_t ram_addr, ram_addr_t size)
++{
++    unsigned long nr_pfn;
++    xen_pfn_t *pfn_list;
++    int i;
++
++    nr_pfn = size >> TARGET_PAGE_BITS;
++    pfn_list = g_malloc(sizeof (*pfn_list) * nr_pfn);
++
++    for (i = 0; i < nr_pfn; i++) {
++        pfn_list[i] = (ram_addr >> TARGET_PAGE_BITS) + i;
++    }
++
++#ifndef XENCTRL_HAS_XC_INTERFACE
++    if (xc_domain_memory_decrease_reservation(xen_xc, xen_domid,
++                                              nr_pfn, 0, pfn_list))
++#else
++    if (xc_domain_decrease_reservation_exact(xen_xc, xen_domid,
++                                       nr_pfn, 0, pfn_list))
++#endif
++    {
++        hw_error("xen: failed to free ram at " RAM_ADDR_FMT, ram_addr);
++    }
++
++    g_free(pfn_list);
++}
++
+ static XenPhysmap *get_physmapping(XenIOState *state,
+                                    hwaddr start_addr, ram_addr_t size)
+ {

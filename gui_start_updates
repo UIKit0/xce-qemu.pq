@@ -1,0 +1,31 @@
+diff --git a/sysemu.h b/sysemu.h
+index f5ac664..a93810b 100644
+--- a/sysemu.h
++++ b/sysemu.h
+@@ -180,7 +182,7 @@ void register_devices(void);
+ void add_boot_device_path(int32_t bootindex, DeviceState *dev,
+                           const char *suffix);
+ char *get_boot_devices_list(uint32_t *size);
+-
++void gui_start_updates(DisplayState *ds);
+ bool usb_enabled(bool default_usb);
+ 
+ #endif
+diff --git a/vl.c b/vl.c
+index 89f8942..3b84d90 100644
+--- a/vl.c
++++ b/vl.c
+@@ -1416,6 +1416,13 @@ void gui_setup_refresh(DisplayState *ds)
+     ds->have_text = have_text;
+ }
+ 
++void
++gui_start_updates(DisplayState *ds)
++{
++    ds->gui_timer = qemu_new_timer_ms(rt_clock, gui_update, ds);
++    qemu_mod_timer(ds->gui_timer, qemu_get_clock_ms(rt_clock));
++}
++
+ struct vm_change_state_entry {
+     VMChangeStateHandler *cb;
+     void *opaque;

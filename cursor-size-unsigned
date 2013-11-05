@@ -1,0 +1,22 @@
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index 9150724..d03f016 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -328,7 +328,7 @@ static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
+     VGACommonState *s = &o->vga;
+     vga_control_page_t *vcp;
+ 
+-    int data_len;
++    size_t data_len;
+     int and_mask_len;
+     int i, j, bpp;
+ 
+@@ -382,7 +382,7 @@ static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
+     }
+ 
+     if (data_len > ORC_VGA_CURSOR_SIZE_MAX) {
+-        qemu_log("%s: ERROR - HW Cursor length invalid (0x%x) - retaining previous cursor",
++        qemu_log("%s: ERROR - HW Cursor length invalid (0x%zx) - retaining previous cursor",
+                  __FUNCTION__, data_len);
+         return cursor_generation;
+     }

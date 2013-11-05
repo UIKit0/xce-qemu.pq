@@ -1,0 +1,2153 @@
+diff --git a/Makefile b/Makefile
+index 43907eb..f5d6da0 100644
+--- a/Makefile
++++ b/Makefile
+@@ -152,6 +152,8 @@ ui/cocoa.o: ui/cocoa.m
+ 
+ ui/sdl.o audio/sdlaudio.o ui/sdl_zoom.o hw/baum.o: QEMU_CFLAGS += $(SDL_CFLAGS)
+ 
++ui/orc-ds.o: QEMU_CFLAGS += -I../orc-client/libDS -I../orc-client/libMon
++
+ ui/vnc.o: QEMU_CFLAGS += $(VNC_TLS_CFLAGS)
+ 
+ bt-host.o: QEMU_CFLAGS += $(BLUEZ_CFLAGS)
+diff --git a/Makefile.target b/Makefile.target
+index 927347b..81573e5 100644
+--- a/Makefile.target
++++ b/Makefile.target
+@@ -119,7 +119,7 @@ obj-$(CONFIG_HAVE_GET_MEMORY_MAPPING) += memory_mapping.o
+ obj-$(CONFIG_HAVE_CORE_DUMP) += dump.o
+ obj-$(CONFIG_NO_GET_MEMORY_MAPPING) += memory_mapping-stub.o
+ obj-$(CONFIG_NO_CORE_DUMP) += dump-stub.o
+-LIBS+=-lz
++LIBS+=-lz -lX11 -lDisplayServerBE -lorccomm
+ 
+ QEMU_CFLAGS += $(VNC_TLS_CFLAGS)
+ QEMU_CFLAGS += $(VNC_SASL_CFLAGS)
+diff --git a/console.h b/console.h
+index 942beb9..260340e 100644
+--- a/console.h
++++ b/console.h
+@@ -109,6 +109,7 @@ void kbd_put_keysym(int keysym);
+ 
+ #define QEMU_BIG_ENDIAN_FLAG    0x01
+ #define QEMU_ALLOCATED_FLAG     0x02
++#define QEMU_SHM_FLAG           0x04
+ 
+ typedef enum {
+         GN_PNP, GN_MONITOR_PNP, GN_DISPLAY_CONFIG, GN_WINDOW_ID, GN_MIRROR_ID, GN_MOUSE_ENABLED
+@@ -178,8 +179,11 @@ struct DisplayChangeListener {
+     void (*dpy_lock)(struct DisplayState *s);
+     void (*dpy_unlock)(struct DisplayState *s);
+ 
++    void (*dpy_reset)(struct DisplayState *s);
++
+     void (*dpy_mouse_set)(struct DisplayState *s, int x, int y, int on);
+     void (*dpy_cursor_define)(struct DisplayState *s, QEMUCursor *cursor);
++    void (*dpy_cursor_enable)(struct DisplayState *s, bool state);
+     void (*hw_set_resolution)(void *opaque);
+     void (*hw_set_orientation)(DisplayState *ds, uint32_t x, uint32_t y, uint32_t r);
+     void (*hw_store_edid)(DisplayState *ds, uint8_t *edid, size_t edid_size);
+@@ -210,7 +214,7 @@ static inline void console_write_ch(console_ch_t *dest, uint32_t ch)
+ 
+ typedef void (*vga_hw_update_ptr)(void *);
+ typedef void (*vga_hw_invalidate_ptr)(void *);
+-typedef void (*vga_hw_screen_dump_ptr)(void *, const char *,
++typedef void (*vga_hw_screen_dump_ptr)(void *, const char *, bool cswitch,
+                                        Error **errp);
+ typedef void (*vga_hw_text_update_ptr)(void *, console_ch_t *);
+ typedef DisplayState * (*vga_hw_add_display_ptr)(void *);
+@@ -378,6 +382,16 @@ static inline void dpy_cursor_define(struct DisplayState *s, QEMUCursor *cursor)
+     }
+ }
+ 
++static inline void dpy_cursor_enable(struct DisplayState *s, bool state)
++{
++    struct DisplayChangeListener *dcl;
++    QLIST_FOREACH(dcl, &s->listeners, next) {
++        if (dcl->dpy_cursor_define) {
++            dcl->dpy_cursor_define(s, cursor);
++        }
++    }
++}
++
+ static inline bool dpy_cursor_define_supported(struct DisplayState *s)
+ {
+     struct DisplayChangeListener *dcl;
+@@ -405,6 +419,14 @@ static inline void dpy_unlock(struct DisplayState *s) {
+     }
+ }
+ 
++static inline void dpy_reset(struct DisplayState *s) {
++    struct DisplayChangeListener *dcl = s->listeners;
++    while (dcl != NULL) {
++        if (dcl->dpy_reset) dcl->dpy_reset(s);
++        dcl = dcl->next;
++    }
++}
++
+ static inline int ds_get_linesize(DisplayState *ds)
+ {
+     return pixman_image_get_stride(ds->surface->image);
+@@ -541,4 +563,5 @@ int index_from_key(const char *key);
+ int index_from_keycode(int code);
+ 
+ int kbd_get_ledstate(void);
++void orc_ds_init(void);
+ #endif
+diff --git a/hw/pc.c b/hw/pc.c
+index 3da1488..474ef5a 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -646,7 +646,6 @@ void orc_bios_init(void)
+     register_ioport_read(0x403, 1, 1, bochs_bios_read, NULL);
+ 
+     fw_cfg = fw_cfg_init(BIOS_CFG_IOPORT, BIOS_CFG_IOPORT + 1, 0, 0);
+-    init_splash_callback(fw_cfg);
+     rom_set_fw(fw_cfg);
+ }
+ 
+diff --git a/mouse.h b/mouse.h
+index e44242e..8f79552 100644
+--- a/mouse.h
++++ b/mouse.h
+@@ -5,6 +5,56 @@
+ #include <X11/Xlib.h>
+ 
+ #define CONFIG_PVMOUSE 1
++#define MOUSE_PROTOCOL_VERSION 2
++
++typedef enum {
++    PV_UNINITIALIZED = 0,
++    PV_WAITING,     // waiting for the pv driver to connect
++    PV_CONNECTED,   // the pv driver is connected
++    PV_ACTIVE,      // mouse windows are mapped and in use
++} pv_state_t;
++
++typedef struct mouse_ring_ent {
++    uint32_t x;
++    uint32_t y;
++    uint32_t button_pressed;
++    uint32_t button_released;
++} mouse_ring_ent_t;
++
++typedef enum {
++    MOUSE_MODE_VIRTUAL = 1,
++    MOUSE_MODE_REAL = 2
++} mouse_mode_t;
++
++
++typedef struct mouse_geometry {
++    int32_t x;
++    int32_t y;
++    int32_t w;
++    int32_t h;
++} mouse_geometry_t;
++
++typedef struct mouse_control {
++    uint32_t base_w;
++    uint32_t base_h;
++    uint32_t head_ent;
++    uint32_t tail_ent;
++    mouse_mode_t mode;
++    uint32_t connected;
++    uint32_t registered;
++    mouse_geometry_t geom[16];
++    uint32_t geometry_sequence;
++    char debug[3800];
++    uint32_t protocol_version;
++    mouse_ring_ent_t ring;
++} mouse_control_t;
++
++/* Must be the size of mouse_ring_ent in bytes, and also be a power of two */
++#define RING_ENTRY_SIZE 16
++#define RING_ENTRY_COUNT (XC_PAGE_SIZE / RING_ENTRY_SIZE)
++
++#define RING_ENTRIES_FREE (RING_ENTRY_COUNT - RING_DEPTH)
++
+ 
+ extern void mouse_init(void);
+ 
+diff --git a/orc_rpc.c b/orc_rpc.c
+index b1d50d3..afa97be 100644
+--- a/orc_rpc.c
++++ b/orc_rpc.c
+@@ -113,28 +113,6 @@ handle_cdrom_eject(QRPCState *s)
+ }
+ 
+ static void
+-handle_video_mode_set(QRPCState *s)
+-{
+-	struct qrpc_method *method = QRPCMETH(s);
+-	struct qrpc_response *resp = QRPCRESP(s);
+-	struct qrpc_video_mode *vm = (struct qrpc_video_mode *)method->data;
+-	int ret = 0;
+-
+-	if (s->msglen < sizeof (*method) + sizeof (*vm)) {
+-		ret = EINVAL;
+-	} else {
+-#if 0
+-		ret = display_pnp(vm->s_cmd, vm->s_mode);
+-
+-		DPRINT(OF_DEBUG_RPC, "%d %s ret %d\n",
+-		       vm->s_cmd, vm->s_mode, ret);
+-#endif
+-	}
+-	resp->status = ret;
+-	send_response(s, sizeof (*resp));
+-}
+-
+-static void
+ handle_set_orc_flags(QRPCState *s)
+ {
+ 	struct qrpc_orc_flags_method *method = 
+@@ -160,62 +138,6 @@ handle_set_orc_flags(QRPCState *s)
+ }
+ 
+ static void
+-handle_cycle_display(QRPCState *s)
+-{
+-	struct qrpc_method *method = QRPCMETH(s);
+-	struct qrpc_response *resp = QRPCRESP(s);
+-
+-	DPRINT(OF_DEBUG_RPC, "%s Cycle display state\n", __func__);
+-
+-	if (s->msglen < sizeof (*method))
+-		resp->status = EINVAL;
+-#if 0
+-	else
+-		resp->status = display_cycle_event();
+-#endif
+-	
+-	send_response(s, sizeof (*resp));
+-}
+-
+-static void
+-handle_crogl_enable(QRPCState *s)
+-{
+-	struct qrpc_method *method = QRPCMETH(s);
+-	struct qrpc_response *resp = QRPCRESP(s);
+-
+-	DPRINT(OF_DEBUG_RPC, "%s\n", __func__);
+-
+-	if (s->msglen < sizeof (*method))
+-		resp->status = EINVAL;
+-#ifdef CONFIG_CROGL
+-	else
+-		resp->status = 0;
+-	
+-	crogl_enabled = 1;
+-#endif
+-	send_response(s, sizeof (*resp));
+-}
+-
+-static void
+-handle_crogl_disable(QRPCState *s)
+-{
+-	struct qrpc_method *method = QRPCMETH(s);
+-	struct qrpc_response *resp = QRPCRESP(s);
+-
+-	DPRINT(OF_DEBUG_RPC, "%s\n", __func__);
+-
+-	if (s->msglen < sizeof (*method))
+-		resp->status = EINVAL;
+-#ifdef CONFIG_CROGL
+-	else
+-		resp->status = 0;
+-	
+-	crogl_enabled = 0;
+-#endif
+-	send_response(s, sizeof (*resp));
+-}
+-
+-static void
+ process_rpc(QRPCState *s)
+ {
+ 	struct qrpc_response *resp;
+@@ -229,9 +151,6 @@ process_rpc(QRPCState *s)
+ 
+ 		DPRINT(OF_DEBUG_RPC, "method %d\n", method->method);
+ 		switch (method->method) {
+-		case QRPC_PM_CYCLE_DISPLAY:
+-			handle_cycle_display(s);
+-			break;
+ 		case QRPC_CD_EJECT:
+ 		case QRPC_CD_DETACH_ISO:
+ 			handle_cdrom_eject(s);
+@@ -240,18 +159,9 @@ process_rpc(QRPCState *s)
+ 		case QRPC_CD_CHANGE:
+ 			handle_cdrom_change(s);
+ 			break;
+-   		case QRPC_VIDEO_MODE_SET:
+-   			handle_video_mode_set(s);
+-   			break;
+    		case QRPC_ORC_FLAGS:
+    			handle_set_orc_flags(s);
+    			break;
+-		case QRPC_CROGL_ENABLE:
+-			handle_crogl_enable(s);
+-			break;
+-		case QRPC_CROGL_DISABLE:
+-			handle_crogl_disable(s);
+-			break;
+ 		default:
+ 			resp = QRPCRESP(s);
+ 			resp->status = EINVAL;
+diff --git a/sysemu.h b/sysemu.h
+index 8a09d31..b5c6caf 100644
+--- a/sysemu.h
++++ b/sysemu.h
+@@ -89,6 +89,7 @@ typedef enum DisplayType
+     DT_CURSES,
+     DT_SDL,
+     DT_NOGRAPHIC,
++    DT_ORC,
+     DT_NONE,
+ } DisplayType;
+ 
+diff --git a/ui/Makefile.objs b/ui/Makefile.objs
+index adc07be..1c772f1 100644
+--- a/ui/Makefile.objs
++++ b/ui/Makefile.objs
+@@ -12,3 +12,4 @@ common-obj-$(CONFIG_SDL) += sdl.o sdl_zoom.o x_keymap.o
+ common-obj-$(CONFIG_COCOA) += cocoa.o
+ common-obj-$(CONFIG_CURSES) += curses.o
+ common-obj-$(CONFIG_VNC) += $(vnc-obj-y)
++common-obj-y += orc-ds.o orc-ds-hid.o
+diff --git a/ui/orc-ds-hid.c b/ui/orc-ds-hid.c
+new file mode 100644
+index 0000000..1908b03
+--- /dev/null
++++ b/ui/orc-ds-hid.c
+@@ -0,0 +1,382 @@
++/*
++ * Xen Client Enterprise Display Manager HID Integration
++ * Copyright (c) Citrix
++ */
++#include "qemu-common.h"
++#include "libDisplayServerBE.h"
++#include "xenctrl.h"
++#include "orc-ds.h"
++#include "orc-keymap.h"
++#include "mouse.h"
++
++extern backend_state be_state;
++
++int
++orc_ds_button_press_cb(NxBackend *be, void *closure, int display_id, int state,
++                 int button, int x, int y,
++                 unsigned xNorm, unsigned yNorm)
++{
++    mouse_ring_ent_t *event;
++
++    if (be_state.pv_state != PV_CONNECTED) {
++        return orc_ds_raw_button_press_cb(be, closure, display_id,
++                                          button, x, y, xNorm, yNorm);
++    }
++
++    if (RING_ENTRIES_FREE) {
++
++        event = RING_ENTRY(be_state.ms_shared_control->head_ent);
++        event->x = xNorm;
++        event->y = yNorm;
++        event->button_pressed = button;
++        event->button_released = 0;
++
++        be_state.ms_shared_control->head_ent = RING_PTR_NEXT;
++
++    } else {
++        qemu_log( "%s: Dropped an event!\n", __func__);
++    }
++
++    return (0);
++}
++
++int
++orc_ds_button_release_cb(NxBackend *be, void *closure, int display_id, int state,
++                   int button, int x, int y,
++                   unsigned xNorm, unsigned yNorm)
++{
++    mouse_ring_ent_t *event;
++
++    if (be_state.pv_state != PV_CONNECTED) {
++        return orc_ds_raw_button_release_cb(be, closure, display_id,
++                                            button, x, y, xNorm, yNorm);
++    }
++
++    if (RING_ENTRIES_FREE) {
++
++        event = RING_ENTRY(be_state.ms_shared_control->head_ent);
++        event->x = xNorm;
++        event->y = yNorm;
++        event->button_pressed = 0;
++        event->button_released = button;
++
++        be_state.ms_shared_control->head_ent = RING_PTR_NEXT;
++
++    } else {
++        qemu_log( "%s: Dropped an event!\n", __func__);
++    }
++
++    return (0);
++}
++
++int
++orc_ds_motion_cb(NxBackend *be, void *closure, int display_id,
++         int state, int x, int y,
++         unsigned xNorm, unsigned yNorm)
++{
++    mouse_ring_ent_t *event;
++
++    /* The queue isn't ready, toss the event on the floor */
++    if (be_state.pv_state != PV_CONNECTED) {
++        return (0);
++    }
++
++    if (RING_ENTRIES_FREE) {
++
++        event = RING_ENTRY(be_state.ms_shared_control->head_ent);
++
++        event->x = xNorm;
++        event->y = yNorm;
++        event->button_pressed = 0;
++        event->button_released = 0;
++
++        /*
++         * Windows treats 0,0 specially in abs mode and doesn't
++         * move the cursor.  This still works because 1,0 in ndc
++         * will map to 0,0 in windows.
++         */
++        if (event->x == 0 && event->y == 0) {
++            event->x = 1;
++        }
++
++        be_state.ms_shared_control->head_ent = RING_PTR_NEXT;
++
++    } else {
++        qemu_log( "%s: Dropped an event!\n", __func__);
++    }
++
++    return (0);
++}
++
++/* Keyboard support and utility functions */
++static void
++send_key(int scancode, key_action_t action)
++{
++#if 0
++    DPRINT(OF_DEBUG_KB, "%s scancode 0x%x\n",
++           key_action_string[action], scancode);
++#endif
++
++    /*
++     * Don't process raw scancodes.
++     */
++    if (action == KEY_RAW) {
++        kbd_put_keycode(scancode);
++        return;
++    }
++
++    /*
++     * Escape high order bit of scancode.
++     */
++    if (scancode & 0x80)
++        kbd_put_keycode(0xe0);
++
++    /*
++     * Set high order bit of scancode for press/release.
++     */
++    if (action == KEY_PRESSED)
++        kbd_put_keycode(scancode & 0x7f);
++    else
++        kbd_put_keycode(scancode | 0x80);
++}
++
++/*
++ * Special key processing requires the key entry in the keypmap
++ * file to be blank or to set the scancode to 0.  This routine
++ * will use the X virtual key to determine which scancode to
++ * emulate.
++ */
++static void
++process_special_keys(int state, int keycode, key_action_t action)
++{
++
++    switch (keycode) {
++
++        case PAUSE_BREAK_KEY:
++
++            if (action != KEY_PRESSED)
++                return;
++
++            if (state & ControlMask) {
++                /*
++                 * Send the ctl-break key sequence.
++                 */
++                send_key(0xc6, KEY_PRESSED);
++                send_key(0xc6, KEY_RELEASED);
++
++            } else {
++                /*
++                 * Send the pause key sequence.
++                 *
++                 * Linux does not see this key sequence as Pause.
++                 * It sees lctl-numlock which are the component
++                 * scancodes here.  Simply sending 0xc6 or 0xc5
++                 * works properly for Linux which merges the break
++                 * and pause keys together as pause.
++                 *
++                 * todo: change codes here based on OS type
++                 */
++                send_key(0xe1, KEY_RAW);
++                send_key(0x1d, KEY_RAW);
++                send_key(0x45, KEY_RAW);
++                send_key(0xe1, KEY_RAW);
++                send_key(0x9d, KEY_RAW);
++                send_key(0xc5, KEY_RAW);
++            }
++
++            break;
++
++        case PRINT_SYSREQ_KEY:
++
++            if (state & (ControlMask | ShiftMask)) {
++                send_key(0xb7, action);
++
++            } else if (state & AltMask) {
++                send_key(0x54, action);
++
++            } else {
++                if (action == KEY_PRESSED) {
++                    send_key(0xaa, action);
++                    send_key(0xb7, action);
++                } else {
++                    send_key(0xb7, action);
++                    send_key(0xaa, action);
++                }
++            }
++        break;
++
++            default:
++        break;
++    }
++}
++
++static unsigned int
++xkeycode_to_scancode(unsigned int keycode)
++{
++    if (keycode > 255)
++        return (0);
++
++    return _scancode[keycode];
++}
++
++int
++orc_ds_key_press_cb(NxBackend *be, void *closure, int dispID,
++            int state, int keycode)
++{
++    int scancode = xkeycode_to_scancode(keycode);
++
++    if (scancode == 0) {
++        process_special_keys(state, keycode, KEY_PRESSED);
++    } else {
++        send_key(scancode, KEY_PRESSED);
++    }
++
++    return (0);
++}
++
++int
++orc_ds_key_release_cb(NxBackend *be, void *closure, int dispID,
++            int state, int keycode)
++{
++    int scancode = xkeycode_to_scancode(keycode);
++
++    if (scancode == 0) {
++        process_special_keys(state, keycode, KEY_RELEASED);
++    } else {
++        send_key(scancode, KEY_RELEASED );
++    }
++
++    return (0);
++}
++
++int
++orc_ds_raw_motion_cb(NxBackend *be, void *closure, int display_id,
++                     int dx, int dy)
++{
++    kbd_mouse_event(dx, dy, 0, be_state.button_state);
++
++    return (0);
++}
++
++/*
++ * There seems to be a bug in the X code somewhere that doesn't allow
++ * us to select for both normal AND raw button events at the same time.
++ * If the code in the display server does this it gets the button down
++ * and motion events when no buttons are pressed, but never gets any
++ * button up or motion events when a button is pressed.  To work around
++ * this the display server always processes the raw button press/release
++ * events, and this code redirects the events to the correct place,
++ * either the PV driver, once it's loaded, or the emulated PS2 mouse.
++ */
++int
++orc_ds_raw_button_press_cb(NxBackend *be, void *closure, int display_id,
++                           unsigned button, int x, int y,
++                           unsigned xNorm, unsigned yNorm)
++{
++    int wheel = 0;
++
++    /* If the pv mouse driver has been loaded, direct events there */
++    if (be_state.pv_state == PV_CONNECTED) {
++        return orc_ds_button_press_cb(be, closure, display_id, 0,
++                                      button, x, y, xNorm, yNorm);
++    }
++
++    switch (button) {
++
++        case Button1:
++            be_state.button_state |= MOUSE_EVENT_LBUTTON;
++        break;
++
++        case Button2:
++            be_state.button_state |= MOUSE_EVENT_MBUTTON;
++        break;
++
++        case Button3:
++            be_state.button_state |= MOUSE_EVENT_RBUTTON;
++        break;
++
++        case Button4:
++            wheel = -1;
++        break;
++
++        case Button5:
++            wheel = 1;
++        break;
++    }
++
++    kbd_mouse_event(0, 0, wheel, be_state.button_state);
++
++    return (0);
++}
++
++int
++orc_ds_raw_button_release_cb(NxBackend *be, void *closure, int display_id,
++                             unsigned button, int x, int y,
++                             unsigned xNorm, unsigned yNorm)
++{
++    int wheel = 0;
++
++    /* If the pv mouse driver has been loaded, direct events there */
++    if (be_state.pv_state == PV_CONNECTED) {
++        return orc_ds_button_release_cb(be, closure, display_id, 0,
++                                        button, x, y, xNorm, yNorm);
++    }
++
++    switch (button) {
++
++        case Button1:
++            be_state.button_state &= ~MOUSE_EVENT_LBUTTON;
++        break;
++
++        case Button2:
++            be_state.button_state &= ~MOUSE_EVENT_MBUTTON;
++        break;
++
++        case Button3:
++            be_state.button_state &= ~MOUSE_EVENT_RBUTTON;
++        break;
++
++        case Button4:
++            wheel = -1;
++        break;
++
++        case Button5:
++            wheel = 1;
++        break;
++    }
++
++    kbd_mouse_event(0, 0, wheel, be_state.button_state);
++
++    return (0);
++}
++
++void
++pv_mouse_cb(void *opaque, uint32_t addr, uint32_t val)
++{
++    DisplayState *ds = opaque;
++    unsigned long host_addr = val;
++    mouse_control_t *shared_control;
++
++    qemu_log( "domU requesting PV mouse...");
++
++    /* Go from waiting to connected */
++    be_state.pv_state = PV_CONNECTED;
++
++    shared_control = (mouse_control_t *) qemu_get_ram_ptr(host_addr);
++    be_state.ms_shared_ring = (mouse_ring_ent_t *) &shared_control->ring;
++
++    strcpy(shared_control->debug, "This is dom0 speaking...");
++
++    be_state.ms_shared_control = shared_control;
++    be_state.ms_shared_control->registered = 1;
++    be_state.ms_shared_control->mode = MOUSE_MODE_VIRTUAL;
++
++    if (ds->vga_state) {
++        display_hw_notify(ds, GN_MOUSE_ENABLED, PV_CONNECTED);
++    }
++
++    if (be_state.be) {
++        NxSetMouseFormat(be_state.be, e_MFAbsolute);
++    }
++}
++
+diff --git a/ui/orc-ds.c b/ui/orc-ds.c
+new file mode 100644
+index 0000000..eaa4d12
+--- /dev/null
++++ b/ui/orc-ds.c
+@@ -0,0 +1,954 @@
++/*
++ * Xen Client Enterprise Display Manager Integration
++ * Copyright (c) 2012 Citrix
++ */
++
++#include <sys/mman.h>
++#include <sys/stat.h>   /* For mode constants */
++#include <fcntl.h>      /* For O_* constants */
++
++#include "xenctrl.h"
++#include "qemu-common.h"
++#include "console.h"
++#include "sysemu.h"
++
++#include "libDisplayServerBE.h"
++#include "orc-ds.h"
++#include "orc_debug.h"
++#include "mouse.h"
++
++// FIX-ME: These includes aren't allowed here
++#include "hw/vga-orc.h"
++
++#define TARGET_PHYS_ADDR_BITS 64
++#include "cpu-common.h"
++
++/*
++ * Do this many retries before we throttle back,
++ * then once throttled back only try to reconnect
++ * every throttled_delta_t seconds.
++ */
++#define MAX_RECONNECT_RETRIES 20
++#define THROTTLED_DELTA_T 2
++
++backend_state be_state;
++
++mouse_geometry_t localGeom[N_MONITORS];
++
++extern int xen_domid;
++
++static struct DisplayChangeListener orc_dcl;
++
++static DisplayState *find_displaystate(int display_id)
++{
++    DisplayState *ds;
++    OrcDsState *fs;
++
++    for (ds = get_displaystate(); ds; ds = ds->next) {
++        fs = (OrcDsState *)ds->opaque;
++
++        if (ds->display_type == DT_ORC && fs->server_display_id == display_id) {
++            return (ds);
++        }
++    }
++
++    return (NULL);
++}
++
++/* Clean-up any old shm handle that we might have left around */
++static void
++cleanup_shm(OrcDsState *fs)
++{
++    /*
++     * We don't care what mode we're in.
++     * If there's stuff to clean up, clean it up.
++     */
++    if (fs->shm_pointer) {
++        shmdt(fs->shm_pointer);
++        fs->shm_pointer = NULL;
++    }
++
++    fs->shm_size = 0;
++    fs->shm_id = 0;
++
++    if (fs->shm_file_name) {
++        unlink(fs->shm_file_name);
++        g_free(fs->shm_file_name);
++        fs->shm_file_name = NULL;
++    }
++}
++
++/* Utility functions: */
++
++static int orc_ds_map_shm(DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++    DisplaySurface *new_surface;
++    key_t key;
++    int fd;
++    int ret = 0;
++
++    if (fs->server_display_id < 0) {
++        return ret;
++    }
++
++    if (!(ds->surface->flags & QEMU_SHM_FLAG)) {
++
++        /* Clean-up any old shm handle that we might have left around */
++        cleanup_shm(fs);
++
++        if (fs->attached) {
++            NxDetachDisplay(be_state.be, fs->server_display_id);
++            fs->attached = FALSE;
++        }
++
++        fs->shm_size = ds_get_height(ds) * ds_get_linesize(ds);
++
++        fs->shm_file_name = g_malloc0(32);
++        sprintf(fs->shm_file_name, "/tmp/shm_XXXXXX");
++        fs->shm_file_name = mktemp(fs->shm_file_name);
++
++        fd = open(fs->shm_file_name, O_CREAT, S_IRWXU);
++        close(fd);
++
++        key = ftok(fs->shm_file_name, 42);
++
++        fs->shm_id = shmget(key, fs->shm_size, IPC_CREAT | IPC_EXCL | 0777);
++        fs->shm_pointer = (uint8_t*)shmat(fs->shm_id, NULL, 0);
++
++        /*
++         * Mark the shared memory segment so that it's deleted
++         * when the last process detaches, else we may leak
++         * system-wide memory.
++         */
++        if (shmctl(fs->shm_id, IPC_RMID, NULL)) {
++            perror("shmctl");
++        }
++
++        NxAttachShmDisplay(be_state.be,
++                           fs->server_display_id,
++                           fs->x_origin,
++                           fs->y_origin,
++                           ds_get_width(ds),
++                           ds_get_height(ds),
++                           ds_get_bits_per_pixel(ds),
++                           fs->shm_size,
++                           fs->shm_id);
++
++        fs->attached = TRUE;
++
++        qemu_log("%s: Displaying %p using the DisplayServer\n",
++                 __func__, ds_get_data(ds));
++
++        ret = 1;
++    }
++
++    new_surface = 
++        qemu_create_displaysurface_from(ds_get_width(ds), ds_get_height(ds),
++                                        ds_get_bits_per_pixel(ds),
++                                        ds_get_linesize(ds), fs->shm_pointer);
++
++    qemu_free_displaysurface(ds);
++    new_surface->flags |= QEMU_SHM_FLAG;
++    ds->surface = new_surface;
++
++    return ret;
++}
++
++static int orc_ds_map_foreign(DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++    int ret = 0;
++
++    if (fs->server_display_id < 0) {
++        return ret;
++    }
++
++    /* Clean-up any old shm handle that we might have left around */
++    cleanup_shm(fs);
++
++    if (fs->attached) {
++        NxDetachDisplay(be_state.be, fs->server_display_id);
++        fs->attached = FALSE;
++    }
++
++    fs->shm_size = ds_get_height(ds) * ds_get_linesize(ds);
++
++    qemu_log("AttachGuestDisplay( id = %d, x = %d, y = %d, "
++             "w = %d, h = %d, bpp = %d, size = %zx, did = %d, addr = %p)",
++             fs->server_display_id, fs->x_origin, fs->y_origin,
++             ds_get_width(ds), ds_get_height(ds),
++             ds_get_bits_per_pixel(ds), fs->shm_size,
++             xen_domid, (void *)qemu_ram_addr_from_host_nofail(ds_get_data(ds)));
++
++    NxAttachGuestDisplay(be_state.be,
++                         fs->server_display_id,
++                         fs->x_origin,
++                         fs->y_origin,
++                         ds_get_width(ds),
++                         ds_get_height(ds),
++                         ds_get_bits_per_pixel(ds),
++                         fs->shm_size,
++                         xen_domid,
++                         qemu_ram_addr_from_host_nofail(ds_get_data(ds)));
++    fs->attached = TRUE;
++
++    ret = 1;
++
++    return ret;
++}
++
++static int orc_ds_setup_shm(DisplayState *ds)
++{
++   if (ds->surface->flags & QEMU_ALLOCATED_FLAG ||
++       ds->surface->flags & QEMU_SHM_FLAG) {
++       return orc_ds_map_shm(ds);
++   } else {
++       return orc_ds_map_foreign(ds);
++   }
++}
++
++/* DisplayServer callback funcions */
++extern char display_name[];
++
++static int orc_ds_ack_connection_cb(NxBackend *be, void *closure, int instance)
++{
++    unsigned char buffer[NxUUID_SIZE+1];
++
++    snprintf((char *)buffer,
++             sizeof (buffer), UUID_FMT,
++             qemu_uuid[0], qemu_uuid[1], qemu_uuid[2],
++             qemu_uuid[3], qemu_uuid[4], qemu_uuid[5],
++             qemu_uuid[6], qemu_uuid[7], qemu_uuid[8],
++             qemu_uuid[9], qemu_uuid[10], qemu_uuid[11],
++             qemu_uuid[12], qemu_uuid[13], qemu_uuid[14],
++             qemu_uuid[15]);
++
++    qemu_log("%s: instance = %d\n", __func__, instance);
++
++    NxGuestInfo(be_state.be, buffer, display_name);
++
++    return (0);
++}
++
++static void
++do_remove_display(DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++    qemu_log("ORC Del Display: server_id = %d, qemu_id = %d\n",
++             fs->server_display_id, ds->display_id);
++
++    if (ds->surface->flags & QEMU_SHM_FLAG) {
++        /*
++         * Give the VGA emulation a surface to render into after
++         * the shared memory buffer goes away.
++         */
++        ds->surface = qemu_resize_displaysurface(ds,
++                                                 ds_get_width(ds),
++                                                 ds_get_height(ds));
++    }
++
++    be_state.n_displays--;
++
++    fs->server_display_id = -1;
++    fs->visible = 0;
++
++    XDestroyRegion(fs->update_region);
++    fs->update_region = XCreateRegion();
++
++    cleanup_shm(fs);
++
++    fs->x_origin = 0;
++    fs->y_origin = 0;
++
++    fs->attached = FALSE;
++}
++
++static int orc_ds_error_cb(NxBackend *be, void *closure, void *data)
++{
++    DisplayState *ds;
++
++    qemu_log("%s: Resetting DS connection\n", __func__);
++
++    for (ds = get_displaystate(); ds; ds = ds->next) {
++	OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++        /* If this display is one of ours, and has a display id, remove it */
++        if (ds->display_type == DT_ORC && fs->server_display_id != -1) {
++	    do_remove_display(ds);
++        }
++    }
++
++    /*
++     * We specifically DO NOT want to clear the EDID
++     * or do a PNP here, else Windows freaks out,
++     * ignores when we reconnect and we lose our
++     * external monitor.
++     */
++
++    qemu_set_fd_handler(be_state.fd, NULL, NULL, NULL);
++    be_state.fd = -1;
++
++    NxDisconnectBackend(be_state.be);
++    be_state.be = NULL;
++
++    be_state.n_displays = 0;
++
++    return (0);
++}
++
++static void
++orc_ds_cursor_define(DisplayState *ds, QEMUCursor *cursor)
++{
++    QEMUCursor *old = be_state.cursor;
++
++    if (be_state.be) {
++        NxDefineCursor(be_state.be, cursor->width, cursor->height,
++                       cursor->hot_x, cursor->hot_y,
++                       32, cursor->data);
++    }
++
++    /*
++     * We need to hold onto this cursor in case we need to
++     * restore it after a failed connection.  We already
++     * have a reference, so no need to "get" another.
++     */
++    be_state.cursor = cursor;
++
++    /*
++     * Release the reference to the old cursor last, in case
++     * we're passed in the same cursor as last time.
++     */
++    cursor_put(old);
++}
++
++static void
++orc_ds_cursor_enable(DisplayState *ds, bool enabled)
++{
++    be_state.cursor_enabled = enabled;
++
++    if (enabled) {
++        NxEnableCursor(be_state.be);
++    } else {
++        NxDisableCursor(be_state.be);
++    }
++}
++
++static void orc_ds_fs_init(DisplayState *ds)
++{
++    OrcDsState *fs;
++
++    qemu_log("%s: Initializing a new DS struct\n", __func__);
++
++    ds->opaque = g_malloc0(sizeof(OrcDsState));
++    fs = (OrcDsState *) ds->opaque;
++
++    fs->update_region = XCreateRegion();
++    fs->server_display_id = -1;
++
++    qemu_log("   Registering DCL\n");
++    fs->dcl = orc_dcl;
++    register_displaychangelistener(ds, &fs->dcl);
++}
++
++static DisplayState *orc_ds_display_create(uint8_t display_id, uint32_t width, uint32_t height)
++{
++    DisplayState *ds = vga_hw_add_display();
++
++    if (!ds) {
++        qemu_log("Failed to create display; there are probably too many.");
++        return NULL;
++    }
++
++    ds->surface = qemu_create_displaysurface(ds, width, height);
++
++    orc_ds_fs_init(ds);
++
++    register_displaystate(ds);
++
++    return (ds);
++}
++
++#define KB_NUM_LED  0x02
++#define KB_CAPS_LED 0x04
++
++static void
++orc_ds_led_handler(void *opaque, int ledstate)
++{
++    int nlState = ledstate & KB_NUM_LED  ? 1 : 0;
++    int clState = ledstate & KB_CAPS_LED ? 1 : 0;
++
++    if (be_state.be) {
++        NxSetLockKeyState(be_state.be, clState, nlState);
++    }
++}
++
++static void
++orc_ds_restore_state(void)
++{
++    /* Restore the cursor state */
++    orc_ds_cursor_enable(NULL, be_state.cursor_enabled);
++    
++    /* Restore the lock key states */
++    orc_ds_led_handler(NULL, kbd_get_ledstate());
++
++    /* Restore the mouse data format */
++    if (be_state.pv_state == PV_CONNECTED) {
++        NxSetMouseFormat(be_state.be, e_MFAbsolute);
++    } else {
++        NxSetMouseFormat(be_state.be, e_MFRelative);
++    }
++}
++
++static int orc_ds_add_display_cb(NxBackend *be, void *closure, int display_id,
++                 XRectangle *geometry, void *edid, size_t edid_size)
++{
++    DisplayState *tds, *ds;
++    OrcDsState *fs;
++
++    ds = find_displaystate(display_id);
++
++    ++be_state.n_displays;
++
++    /* Did we find an existing ds to reattach to? */
++    if (!ds) {
++
++        /* Nope, must be a new monitor, find a free ds */
++        for (tds = get_displaystate(); tds; tds = tds->next) {
++            fs = (OrcDsState *)tds->opaque;
++            if ((tds->display_type == DT_ORC && fs->server_display_id == -1) ||
++                (tds->display_type == DT_NONE)) {
++                ds = tds;
++                break;
++            }
++        }
++
++        /* Still no ds to use, create a new one */
++        if (!ds) {
++            ds = orc_ds_display_create(display_id, 
++                                       geometry->width, geometry->height);
++        }
++        if (!ds) {
++            return -1;
++        }
++    }
++
++    qemu_log("ORC Add Display: server_id = %d, qemu_id = %d\n",
++             display_id, ds->display_id);
++
++    fs = (OrcDsState *)ds->opaque;
++
++    ds->display_type = DT_ORC;
++    fs->server_display_id = display_id;
++
++    /*
++     * For an initial mapping set origin to -1,-1
++     * so the display server knows to not process
++     * the geometry information to rearrange the
++     * monitors.  Once the guest sees the new
++     * monitor it will (hopefully) place it where
++     * it was told and give us the new geometry.
++     * We will then pass that along to the display
++     * server.  Later on, if we unmap and remap
++     * the memory we'll use the x and y origin
++     * values in fs.
++     */
++    fs->x_origin = -1;
++    fs->y_origin = -1;
++
++    orc_ds_setup_shm(ds);
++
++#if 0    /* For debugging */
++    if (be_state.ms_shared_control) {
++        mouse_geometry_t *geom = be_state.ms_shared_control->geom;
++        mouse_geometry_t lgeom[N_MONITORS] __attribute__ ((unused));
++        int i = 0;
++	for (i = 0; i < N_MONITORS; i++) {
++            lgeom[i] = geom[i];
++        }
++        i++;
++    }
++#endif
++
++    fs->x_origin = geometry->x;
++    fs->y_origin = geometry->y;
++
++    /* Make a copy of the EDID data. */
++    fs->edid_size = MIN(edid_size, EDID_SIZE);
++    memcpy(&fs->edid[0], edid, fs->edid_size);
++
++    if (ds->hw_store_edid) {
++        ds->hw_store_edid(ds, fs->edid, fs->edid_size);
++    }
++
++    if (ds->hw_set_orientation) {
++        qemu_log("%s: setting orientation to %d,%d\n",
++                 __func__, fs->x_origin, fs->y_origin);
++        ds->hw_set_orientation(ds, fs->x_origin, fs->y_origin, 0);
++    }
++
++    display_hw_notify(ds, GN_MONITOR_PNP, 1);
++
++    /* Restore the current cursor, if any */
++    if (be_state.cursor) {
++        NxDefineCursor(be_state.be,
++                       be_state.cursor->width,
++                       be_state.cursor->height,
++                       be_state.cursor->hot_x,
++                       be_state.cursor->hot_y,
++                       32,
++                       be_state.cursor->data);
++    }
++
++    if (!ds->gui_timer) {
++        gui_start_updates(ds);
++    }
++
++    return (0);
++}
++
++static int orc_ds_set_guest_layout_cb(NxBackend *be, void *closure,
++                                      unsigned nDisplays,
++                                      NxLayout *displayLayouts)
++{
++    DisplayState *ds, *pnp_ds = NULL;
++    unsigned i;
++
++    qemu_log("orc_ds_set_guest_layout_cb: got new layout from DS\n");
++
++    for (i=0; i<nDisplays; i++) {
++        ds = find_displaystate(displayLayouts[i].dispId);
++
++        if (!ds) {
++            continue;
++        }
++
++        pnp_ds = ds;
++
++        qemu_log("From DS: disp = %5d, %5d,%5d %5dx%5d\n",
++                displayLayouts[i].dispId,
++                displayLayouts[i].geom.x,
++                displayLayouts[i].geom.y,
++                displayLayouts[i].geom.width,
++                displayLayouts[i].geom.height);
++
++        if (ds->hw_set_orientation) {
++            qemu_log("%s: setting orientation to %d,%d\n",
++                     __func__, displayLayouts[i].geom.x,
++                               displayLayouts[i].geom.y);
++            ds->hw_set_orientation(ds, displayLayouts[i].geom.x,
++                                       displayLayouts[i].geom.y, 0);
++        }
++    }
++
++    /* Width and height are ignored. DisplayServer will scale if needed. */
++    if (pnp_ds) {
++        display_hw_notify(pnp_ds, GN_MONITOR_PNP, 1);
++    }
++
++    return (0);
++}
++
++static int orc_ds_remove_display_cb(NxBackend *be, void *closure, int display_id)
++{
++    DisplayState *ds = find_displaystate(display_id);
++
++    if (ds) {
++        OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++        do_remove_display(ds);
++
++        /* Clear the EDID data. */
++        memset(&fs->edid[0], 0, EDID_SIZE);
++        fs->edid_size = 0;
++
++        if (ds->hw_store_edid) {
++            ds->hw_store_edid(ds, fs->edid, EDID_SIZE);
++        }
++
++        display_hw_notify(ds, GN_MONITOR_PNP, 1);
++
++    } else {
++        qemu_log("ORC Del Display: No display found to remove\n");
++    }
++
++    return (0);
++}
++
++static int
++orc_ds_visibility_cb(NxBackend *be, void *closure, int display_id, int isVisible)
++{
++    DisplayState *ds = find_displaystate(display_id);
++
++    if (ds) {
++        OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++        fs->visible = isVisible;
++    }
++
++    return (0);
++}
++
++
++/* QEMU callback function called when input is available */
++static void display_server_io_handler(void *opaque)
++{
++    NxProcessInput((NxBackend *)opaque);
++}
++
++/* Callback table */
++static NxCallbacks cb = {
++    .closure                 = NULL,
++    .AckConnection           = orc_ds_ack_connection_cb,
++    .AddDisplay              = orc_ds_add_display_cb,
++    .RemoveDisplay           = orc_ds_remove_display_cb,
++    .SetGuestDisplayLayout   = orc_ds_set_guest_layout_cb,
++/*    .DisplayAttached         = orc_ds_display_attached_cb,*/
++    .MouseButtonPressEvent   = orc_ds_button_press_cb,
++    .MouseButtonReleaseEvent = orc_ds_button_release_cb,
++    .KeyPressEvent           = orc_ds_key_press_cb,
++    .KeyReleaseEvent         = orc_ds_key_release_cb,
++    .MousePointerMotionEvent = orc_ds_motion_cb,
++    .RawMotionEvent          = orc_ds_raw_motion_cb,
++    .RawButtonPressEvent     = orc_ds_raw_button_press_cb,
++    .RawButtonReleaseEvent   = orc_ds_raw_button_release_cb,
++/*    .ReconfigureDisplay    = orc_ds_reconfigure_display_cb, */
++/*    .HidEvent              = orc_ds_hid_cb, */
++    .VisibilityChange        = orc_ds_visibility_cb,
++    .ErrorHandler            = orc_ds_error_cb,
++};
++
++/* Function called to connect or reconnect to the backend */
++static int orc_ds_connect_backend(void)
++{
++    if (!be_state.be) {
++
++        /* Retry MAX_RECONNECT_RETRIES before we throttle back */
++        if (be_state.reconnect_retries++ > MAX_RECONNECT_RETRIES) {
++            time_t now = time(NULL);
++
++            /* We're throttled back, wait for next reconnect time */
++            if (now < be_state.reconnect_time) {
++                return (1);
++            }
++
++            /* Next reconnect time will be in 2 seconds */
++            be_state.reconnect_time = time(NULL) + THROTTLED_DELTA_T;
++        }
++
++        be_state.be = NxConnectBackend(&cb);
++        if (!be_state.be) {
++            qemu_log("  Display server connect failed...\n");
++            return (-1);
++        }
++
++        qemu_log("  Display server connect succeeded...\n");
++
++        be_state.reconnect_retries = 0;
++        be_state.fd = NxConnectionNumber(be_state.be);
++
++        if (be_state.fd >= 0) {
++            qemu_set_fd_handler(be_state.fd,
++                                display_server_io_handler,
++                                NULL,
++                                be_state.be);
++        }
++
++        /* Set/Restore the system state */
++        orc_ds_restore_state();
++    }
++
++    return (0);
++}
++
++/* DisplayChangeListener functions */
++static void orc_ds_update(DisplayState *ds, int x, int y, int w, int h)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++    XRectangle rect;
++
++    if (fs->server_display_id < 0)
++        return;
++
++    rect.x = x;
++    rect.y = y;
++    rect.width = w;
++    rect.height = h;
++
++    XUnionRectWithRegion(&rect, fs->update_region, fs->update_region);
++}
++
++static void orc_ds_setdata(DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++    if (fs->server_display_id < 0) {
++        return;
++    }
++
++    /* Redo shared memory allocation if necessary */
++    orc_ds_setup_shm(ds);
++}
++
++static void orc_ds_resize(DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++    if (fs->server_display_id < 0) {
++        return;
++    }
++
++    /* Redo shared memory allocation if necessary */
++    if (!orc_ds_setup_shm(ds)) {
++
++        /* Otherwise just resize the display */
++        NxResizeDisplay(be_state.be, fs->server_display_id,
++                        fs->x_origin, fs->y_origin,
++                        ds_get_width(ds),
++                        ds_get_height(ds),
++                        ds_get_bits_per_pixel(ds));
++    }
++}
++
++
++static void orc_ds_check_layout(DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++    if (be_state.ms_shared_control) {
++        int index;
++        uint32_t geometry_sequence;
++        mouse_geometry_t *geom = be_state.ms_shared_control->geom;
++
++        index = ds->display_id;
++
++        geometry_sequence = be_state.ms_shared_control->geometry_sequence;
++
++        /* Has the position changed? */
++        if (geometry_sequence != be_state.geometry_sequence &&
++            (geometry_sequence & 1) == 0) {
++
++            DisplayState *tds;
++            NxLayout layouts[be_state.n_displays];
++            int nLayouts = 0;
++
++            /*
++             * Make a local copy of the guest shared memory
++             * so it's visible in gdb.  Change this when we
++             * support more monitors.
++             */
++#if 1    /* For debugging */
++            int i = 0;
++            for (i = 0; i < N_MONITORS; i++) {
++                localGeom[i] = geom[i];
++            }
++#endif
++
++            /* Yes, save the new information */
++            be_state.geometry_sequence = geometry_sequence;
++
++            fs->x_origin = geom[index].x;
++            fs->y_origin = geom[index].y;
++
++            /* Put together a new NxLayout to send to the display server */
++            for (tds = get_displaystate(); tds; tds = tds->next) {
++                OrcDsState *tfs = (OrcDsState *)tds->opaque;
++                if (tds->display_type == DT_ORC &&
++                    tfs->server_display_id != -1) {
++
++                    geom = &be_state.ms_shared_control->geom[tds->display_id];
++
++                    layouts[nLayouts].dispId      = tfs->server_display_id;
++                    layouts[nLayouts].geom.x      = geom->x;
++                    layouts[nLayouts].geom.y      = geom->y;
++                    layouts[nLayouts].geom.width  = geom->w;
++                    layouts[nLayouts].geom.height = geom->h;
++
++                    nLayouts++;
++                }
++            }
++
++            /* Only send layouts if there is at least 1 monitor... */
++            if (nLayouts > 0) {
++
++                /* Make sure the layout has actually changed */
++                if (nLayouts != be_state.n_last_layouts ||
++                    memcmp(be_state.last_layouts, layouts, 
++                           nLayouts * sizeof(NxLayout)) != 0) {
++
++                    int l;
++
++                    qemu_log("orc_ds_refresh: sending new layout to DS\n");
++
++                    for (l = 0; l < nLayouts; l++) {
++                        qemu_log("  To DS: disp = %5d, %5d,%5d %5dx%5d\n",
++                                layouts[l].dispId,
++                                layouts[l].geom.x,
++                                layouts[l].geom.y,
++                                layouts[l].geom.width,
++                                layouts[l].geom.height);
++                    }
++
++                    NxSetServerDisplayLayout(be_state.be, nLayouts, layouts);
++
++                    /* Save away this set of layouts */
++                    memcpy(be_state.last_layouts,
++                           layouts, 
++                           nLayouts * sizeof(NxLayout));
++
++                    be_state.n_last_layouts = nLayouts;
++                }
++            }
++        }
++    }
++}
++
++static void orc_ds_refresh(DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++    /* If we're not connected to the back end try to reconnect */
++    if (!be_state.be) {
++        orc_ds_connect_backend();
++        return;
++    }
++
++    if (ds->display_id == 0) {
++        display_hw_update(ds);
++    }
++
++    if (fs->server_display_id < 0) {
++        return;
++    }
++
++    orc_ds_check_layout(ds);
++
++    /*
++     * Don't try to repaint anything if there's no region to update.
++     */
++    if (!XEmptyRegion(fs->update_region)) {
++
++        /*
++         * If this is a local surface, as opposed to one shared
++         * by the guest directly then copy the data from the guest
++         * buffer to the shared buffer.
++         */
++        if ((ds->surface->flags & QEMU_ALLOCATED_FLAG) && fs->shm_pointer) {
++            memcpy(fs->shm_pointer, ds_get_data(ds), fs->shm_size);
++        }
++
++        NxRepaintRegion(be_state.be, fs->server_display_id, fs->update_region);
++
++        XDestroyRegion(fs->update_region);
++
++        fs->update_region = XCreateRegion();
++    }
++}
++
++static void orc_ds_reset(DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++    if (ds->vga_state) {
++
++        if (ds->hw_store_edid && fs->edid_size) {
++            ds->hw_store_edid(ds, fs->edid, fs->edid_size);
++        }
++
++        if (ds->hw_set_orientation) {
++            qemu_log("%s: setting orientation to %d,%d\n",
++                     __func__, fs->x_origin, fs->y_origin);
++            ds->hw_set_orientation(ds, fs->x_origin, fs->y_origin, 0);
++        }
++
++        display_hw_notify(ds, GN_MONITOR_PNP, 1);
++    }
++}
++
++static void orc_ds_lock(struct DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++    /*
++     * This function will not return until all display
++     * server commands have been completed.
++     */
++    if (be_state.be && fs->server_display_id >= 0) {
++        NxLockDisplay(be_state.be, fs->server_display_id);
++    }
++}
++
++
++static void orc_ds_unlock(struct DisplayState *ds)
++{
++    OrcDsState *fs = (OrcDsState *)ds->opaque;
++
++    if (be_state.be && fs->server_display_id >= 0) {
++        NxUnlockDisplay(be_state.be, fs->server_display_id);
++    }
++}
++
++
++static struct DisplayChangeListener orc_dcl = {
++
++    .gui_timer_interval = 0,
++    .dpy_gfx_update = orc_ds_update,
++    .dpy_gfx_resize = orc_ds_resize,
++    .dpy_gfx_setdata = orc_ds_setdata,
++    .dpy_refresh = orc_ds_refresh,
++    .dpy_reset = orc_ds_reset,
++    .dpy_text_cursor = NULL,
++    .dpy_cursor_define = orc_ds_cursor_define,
++    .dpy_cursor_enable = orc_ds_cursor_enable,
++    .dpy_lock = orc_ds_lock,
++    .dpy_unlock = orc_ds_unlock,
++    .next = NULL
++};
++
++/* Initialization function
++ *
++ * This is the only function which should be called directly and
++ * explicitly by QEMU
++ */
++void orc_ds_init(void)
++{
++    DisplayState *ds;
++
++    orc_ds_connect_backend();
++
++    /* Run through all existing ds structs */
++    for (ds = get_displaystate(); ds; ds = ds->next) {
++        /* If the ds has no opaque initialize an fs for it */
++        if (!ds->opaque)
++            orc_ds_fs_init(ds);
++    }
++
++    ds = get_displaystate();
++
++    /*
++     * Register for LED events, so we know when the guest
++     * programatically sets the numlock / capslock. This
++     * should be reflected in the physical platform.
++     */
++    qemu_add_led_event_handler(orc_ds_led_handler, NULL);
++
++    /*
++     * If we've already been initialized by a write to the ioport
++     * then don't reset things if called again.  We may get into
++     * this code during a reset due to an X server crash.
++     */
++    if (!be_state.ms_shared_control) {
++        register_ioport_write(0xff90, 1, 4, pv_mouse_cb, (void *)ds);
++        be_state.ms_shared_control = (mouse_control_t *)  NULL;
++        be_state.ms_shared_ring = (mouse_ring_ent_t *) NULL;
++
++        be_state.pv_state = PV_WAITING;
++    }
++}
++
++/* Local Variables: */
++/*   c-indent-level: 4 */
++/*   c-basic-offset: 4 */
++/* End: */
++// vim:ts=4 sw=4 tw=80 expandtab smartindent
+diff --git a/ui/orc-ds.h b/ui/orc-ds.h
+new file mode 100644
+index 0000000..a088065
+--- /dev/null
++++ b/ui/orc-ds.h
+@@ -0,0 +1,133 @@
++
++/*
++ * Xen Client Enterprise Display Manager Integration
++ * Copyright (c) 2012 Citrix
++ */
++
++#ifndef __ORC_DS_H__
++#define __ORC_DS_H__
++
++#include <X11/Xlib.h>
++#include "console.h"
++#include "mouse.h"
++#include "hw/vga-orc.h"
++
++#define TARGET_PHYS_ADDR_BITS 64
++#include "cpu-common.h"
++
++#define RING_DEPTH ((be_state.ms_shared_control->head_ent >=         \
++    be_state.ms_shared_control->tail_ent) ?                          \
++       (be_state.ms_shared_control->head_ent -                       \
++        be_state.ms_shared_control->tail_ent) :                      \
++       (be_state.ms_shared_control->head_ent +                       \
++        RING_ENTRY_COUNT - be_state.ms_shared_control->tail_ent))
++
++#define RING_PTR_NEXT ((be_state.ms_shared_control->head_ent+1) <    \
++    RING_ENTRY_COUNT ?                                      \
++    (be_state.ms_shared_control->head_ent+1) : (0))
++
++#define RING_ENTRY(x) ((mouse_ring_ent_t *)&(be_state.ms_shared_ring)[x])
++
++#define N_MONITORS 16
++
++typedef struct OrcDsState_t {
++
++    int32_t guest_id;
++    int32_t server_display_id;
++
++    bool    attached;
++
++    Region  update_region;  /* Rectangle queue */
++    uint8_t visible;
++
++    void   *shm_pointer;
++    char   *shm_file_name;
++    size_t  shm_size;
++    int     shm_id;
++
++    int     x_origin;
++    int     y_origin;
++
++    uint8_t edid[EDID_SIZE];  /* EDID from the AddDisplay callback */
++    size_t  edid_size;
++
++    DisplayChangeListener dcl;
++
++} OrcDsState;
++
++/* One backend connection */
++typedef struct backend_state {
++    NxBackend *be;
++    int        fd;
++    int        n_displays;
++    int        reconnect_retries;
++    time_t     reconnect_time;
++
++    /* Current cursor definition */
++    QEMUCursor *cursor;
++
++    /* Cursor state */
++    bool cursor_enabled;
++
++    uint32_t geometry_sequence;
++    NxLayout last_layouts[N_MONITORS];
++    uint32_t n_last_layouts;
++
++    /* Mouse state */
++    pv_state_t        pv_state;
++    mouse_control_t  *ms_shared_control;
++    mouse_ring_ent_t *ms_shared_ring;
++
++    int               button_state;
++} backend_state;
++
++typedef enum key_action {
++    KEY_PRESSED,
++    KEY_RELEASED,
++    KEY_RAW
++} key_action_t;
++
++#define AltMask Mod1Mask
++
++#define PRINT_SYSREQ_KEY 0x6b
++#define PAUSE_BREAK_KEY  0x7f
++
++/* orc-ds-hid.c */
++int
++orc_ds_button_press_cb(NxBackend *be, void *closure, int display_id, int state,
++                 int button, int x, int y,
++                 unsigned xNorm, unsigned yNorm);
++int
++orc_ds_button_release_cb(NxBackend *be, void *closure, int display_id, int state,
++                   int button, int x, int y,
++                   unsigned xNorm, unsigned yNorm);
++int
++orc_ds_motion_cb(NxBackend *be, void *closure, int display_id,
++         int state, int x, int y,
++         unsigned xNorm, unsigned yNorm);
++int
++orc_ds_key_press_cb(NxBackend *be, void *closure, int dispID,
++            int state, int keycode);
++int
++orc_ds_key_release_cb(NxBackend *be, void *closure, int dispID,
++            int state, int keycode);
++int
++orc_ds_raw_motion_cb(NxBackend *be, void *closure, int display_id,
++                     int dx, int dy);
++int
++orc_ds_raw_button_press_cb(NxBackend *be, void *closure, int display_id,
++                           unsigned button, int x, int y,
++                           unsigned xNorm, unsigned yNorm);
++int
++orc_ds_raw_button_release_cb(NxBackend *be, void *closure, int display_id,
++                             unsigned button, int x, int y,
++                             unsigned xNorm, unsigned yNorm);
++void
++pv_mouse_cb(void *opaque, uint32_t addr, uint32_t val);
++#endif
++
++/* Local Variables: */
++/*   c-indent-level: 4 */
++/*   c-basic-offset: 4 */
++/* End: */
++// vim:ts=4 sw=4 tw=80 expandtab smartindent
+diff --git a/ui/orc-keymap.h b/ui/orc-keymap.h
+new file mode 100644
+index 0000000..45d594b
+--- /dev/null
++++ b/ui/orc-keymap.h
+@@ -0,0 +1,304 @@
++
++/*
++ * Xen Client Enterprise Display Manager Integration
++ * Copyright (c) 2012 Citrix
++ */
++
++#ifndef ORC_KEYMAP_H
++#define ORC_KEYMAP_H 1
++
++/*
++ * Map X keycodes to PC scancodes.
++ *
++ * This array maps X keycodes to PC scancodes independent of language.
++ * The X keycode is simply the Linux keycode + 8.  The linux keycodes
++ * from 1 to 88 are PC scancodes.  From 89 up Linux remaps the scancodes
++ * into its own numbering scheme. This table adjusts for the X offset
++ * as well as reverse mapping the Linux codes back to PC scancodes.
++ *
++ * Examples of key code mappings:
++ *	ESC:		PC scancode 1 -> Linux keycode 1 -> X keycode 9
++ *	KP_Enter:	PC scancode 0x9c -> Linux keycode 96 -> X keycode 104
++ *
++ * To update this table, use xev to determine the X keycode associated
++ * with the key you wish to add.  Then use showkey -s to get the PC
++ * scancode associated with the same key.  Add the PC scancode into
++ * this table using the X keycode as the table index. It's important to
++ * know that send_key() handles the 0xe0 escape code for scancodes > 127.
++ * The escape handling is necessary since the PC scancode uses bit 7 to
++ * signify press/release operations.  Extended PC scancodes > 127 cannot
++ * use bit 7 so the 0xe0 prefix is used. Using the Lenovo audio play key
++ * as an example, you will see that showkey yields 0xe0 0x22 on press and
++ * 0xe0 0xa2 on release of the key.  Xev yields 172 on key press/release.
++ * So at index 172 in _scancode you enter 0xa2.  Send_key() will take
++ * the 0xa2 and escape the high order bit by sending 0xe0 0x22 on press
++ * and then 0xe0 0xa2 on release which is what the guest will be expecting.
++ *
++ * For complex PC scancodes such as pause, break, sysrq, ... this scancode
++ * table cannot be used.  For these and other special key encodings enter
++ * 0 as the PC scancode in this table and add the necessary special key
++ * sequence handling in process_special_keys().  See process_key().
++ *
++ * See the Microsoft document "Keyboard Scan Code Specification".
++ */
++
++static unsigned char _scancode[256] = {
++	0x00,	/*   0 (0x00) */
++	0x00,	/*   1 (0x01) */
++	0x00,	/*   2 (0x02) */
++	0x00,	/*   3 (0x03) */
++	0x00,	/*   4 (0x04) */
++	0x00,	/*   5 (0x05) */
++	0x00,	/*   6 (0x06) */
++	0x00,	/*   7 (0x07) */
++	0x00,	/*   8 (0x08) */
++	0x01,	/*   9 (0x09) -  <Escape> */
++	0x02,	/*  10 (0x0a) -  <1> */
++	0x03,	/*  11 (0x0b) -  <2> */
++	0x04,	/*  12 (0x0c) -  <3> */
++	0x05,	/*  13 (0x0d) -  <4> */
++	0x06,	/*  14 (0x0e) -  <5> */
++	0x07,	/*  15 (0x0f) -  <6> */
++	0x08,	/*  16 (0x10) -  <7> */
++	0x09,	/*  17 (0x11) -  <8> */
++	0x0a,	/*  18 (0x12) -  <9> */
++	0x0b,	/*  19 (0x13) -  <0> */
++	0x0c,	/*  20 (0x14) -  <minus> */
++	0x0d,	/*  21 (0x15) -  <equal> */
++	0x0e,	/*  22 (0x16) -  <BackSpace> */
++	0x0f,	/*  23 (0x17) -  <Tab> */
++	0x10,	/*  24 (0x18) -  <q> */
++	0x11,	/*  25 (0x19) -  <w> */
++	0x12,	/*  26 (0x1a) -  <e> */
++	0x13,	/*  27 (0x1b) -  <r> */
++	0x14,	/*  28 (0x1c) -  <t> */
++	0x15,	/*  29 (0x1d) -  <y> */
++	0x16,	/*  30 (0x1e) -  <u> */
++	0x17,	/*  31 (0x1f) -  <i> */
++	0x18,	/*  32 (0x20) -  <o> */
++	0x19,	/*  33 (0x21) -  <p> */
++	0x1a,	/*  34 (0x22) -  <bracketleft> */
++	0x1b,	/*  35 (0x23) -  <bracketright> */
++	0x1c,	/*  36 (0x24) -  <Return> */
++	0x1d,	/*  37 (0x25) -  <Control_L> */
++	0x1e,	/*  38 (0x26) -  <a> */
++	0x1f,	/*  39 (0x27) -  <s> */
++	0x20,	/*  40 (0x28) -  <d> */
++	0x21,	/*  41 (0x29) -  <f> */
++	0x22,	/*  42 (0x2a) -  <g> */
++	0x23,	/*  43 (0x2b) -  <h> */
++	0x24,	/*  44 (0x2c) -  <j> */
++	0x25,	/*  45 (0x2d) -  <k> */
++	0x26,	/*  46 (0x2e) -  <l> */
++	0x27,	/*  47 (0x2f) -  <semicolon> */
++	0x28,	/*  48 (0x30) -  <apostrophe> */
++	0x29,	/*  49 (0x31) -  <grave> */
++	0x2a,	/*  50 (0x32) -  <Shift_L> */
++	0x2b,	/*  51 (0x33) -  International KB */
++	0x2c,	/*  52 (0x34) -  <z> */
++	0x2d,	/*  53 (0x35) -  <x> */
++	0x2e,	/*  54 (0x36) -  <c> */
++	0x2f,	/*  55 (0x37) -  <v> */
++	0x30,	/*  56 (0x38) -  <b> */
++	0x31,	/*  57 (0x39) -  <n> */
++	0x32,	/*  58 (0x3a) -  <m> */
++	0x33,	/*  59 (0x3b) -  <comma> */
++	0x34,	/*  60 (0x3c) -  <period> */
++	0x35,	/*  61 (0x3d) -  <slash> */
++	0x36,	/*  62 (0x3e) -  <Shift_R> */
++	0x37,	/*  63 (0x3f) -  <KP_Multiply> */
++	0x38,	/*  64 (0x40) -  <Alt_L> */
++	0x39,	/*  65 (0x41) -  <space> */
++	0x3a,	/*  66 (0x42) -  <Caps_Lock> */
++	0x3b,	/*  67 (0x43) -  <F1> */
++	0x3c,	/*  68 (0x44) -  <F2> */
++	0x3d,	/*  69 (0x45) -  <F3> */
++	0x3e,	/*  70 (0x46) -  <F4> */
++	0x3f,	/*  71 (0x47) -  <F5> */
++	0x40,	/*  72 (0x48) -  <F6> */
++	0x41,	/*  73 (0x49) -  <F7> */
++	0x42,	/*  74 (0x4a) -  <F8> */
++	0x43,	/*  75 (0x4b) -  <F9> */
++	0x44,	/*  76 (0x4c) -  <F10> */
++	0x45,	/*  77 (0x4d) -  <Num_Lock> */
++	0x46,	/*  78 (0x4e) -  <Scroll_Lock> */
++	0x47,	/*  79 (0x4f) -  <KP_Home> */
++	0x48,	/*  80 (0x50) -  <KP_Up> */
++	0x49,	/*  81 (0x51) -  <KP_Prior> */
++	0x4a,	/*  82 (0x52) -  <KP_Subtract> */
++	0x4b,	/*  83 (0x53) -  <KP_Left> */
++	0x4c,	/*  84 (0x54) -  <KP_Begin> */
++	0x4d,	/*  85 (0x55) -  <KP_Right> */
++	0x4e,	/*  86 (0x56) -  <KP_Add> */
++	0x4f,	/*  87 (0x57) -  <KP_End> */
++	0x50,	/*  88 (0x58) -  <KP_Down> */
++	0x51,	/*  89 (0x59) -  <KP_Next> */
++	0x52,	/*  90 (0x5a) -  <KP_Insert> */
++	0x53,	/*  91 (0x5b) -  <KP_Delete> */
++	0x00,	/*  92 (0x5c) */
++	0x00,	/*  93 (0x5d) */
++	0x56,	/*  94 (0x5e) -  International KB <less> */
++	0x57,	/*  95 (0x5f) -  <F11> */
++	0x58,	/*  96 (0x60) -  <F12> */
++	0x73,	/*  97 (0x61) -  <Backslash> */
++	0x00,	/*  98 (0x62) */
++	0x00,	/*  99 (0x63) */
++	0x79,	/* 100 (0x64) -  <Henkan_Mode> */
++	0x70,	/* 101 (0x65) -  <Hiragana_Katagana> */
++	0x7b,	/* 102 (0x66) -  <Muhenkan> */
++	0x00,	/* 103 (0x67) */
++	0x9c,	/* 104 (0x68) -  <KP_Enter> */
++	0x9d,	/* 105 (0x69) -  <Control_R> */
++	0xb5,	/* 106 (0x6a) -  <KP_Divide> */
++	0x00, 	/* 107 (0x6b) -  <Print> (was 0xb7) */
++	0xb8,	/* 108 (0x6c) -  <Alt_R> */
++	0x00,	/* 109 (0x6d) */
++	0xc7,	/* 110 (0x6e) -  <Home> */
++	0xc8,	/* 111 (0x6f) -  <Up> */
++	0xc9,	/* 112 (0x70) -  <Prior> */
++	0xcb,	/* 113 (0x71) -  <Left> */
++	0xcd,	/* 114 (0x72) -  <Right> */
++	0xcf,	/* 115 (0x73) -  <End> */
++	0xd0,	/* 116 (0x74) -  <Down> */
++	0xd1,	/* 117 (0x75) -  <Next> */
++	0xd2,	/* 118 (0x76) -  <Insert> */
++	0xd3,	/* 119 (0x77) -  <Delete> */
++	0x00,	/* 120 (0x78) */
++	0x00,	/* 121 (0x79) */
++	0x00,	/* 122 (0x7a) */
++	0x00,	/* 123 (0x7b) */
++	0x00,	/* 124 (0x7c) */
++	0x00,	/* 125 (0x7d) */
++	0x00,	/* 126 (0x7e) */
++	0x00,	/* 127 (0x7f) -  <Pause> */
++	0x00,	/* 128 (0x80) */
++	0x00,	/* 129 (0x81) */
++	0x00,	/* 130 (0x82) */
++	0x00,	/* 131 (0x83) */
++	0x7d,	/* 132 (0x84) -  <Yen> */
++	0xdb,	/* 133 (0x85) -  <Super_L> */
++	0xdc,	/* 134 (0x86) -  <Super_R> */
++	0xdd,	/* 135 (0x87) -  <Menu> */
++	0x00,	/* 136 (0x88) */
++	0x00,	/* 137 (0x89) */
++	0x00,	/* 138 (0x8a) */
++	0x00,	/* 139 (0x8b) */
++	0x00,	/* 140 (0x8c) */
++	0x00,	/* 141 (0x8d) */
++	0x00,	/* 142 (0x8e) */
++	0x00,	/* 143 (0x8f) */
++	0x00,	/* 144 (0x90) */
++	0x00,	/* 145 (0x91) */
++	0x00,	/* 146 (0x92) */
++	0x00,	/* 147 (0x93) */
++	0x00,	/* 148 (0x94) */
++	0x00,	/* 149 (0x95) */
++	0x00,	/* 150 (0x96) */
++	0x00,	/* 151 (0x97) */
++	0x00,	/* 152 (0x98) */
++	0x00,	/* 153 (0x99) */
++	0x00,	/* 154 (0x9a) */
++	0x00,	/* 155 (0x9b) */
++	0x00,	/* 156 (0x9c) */
++	0x00,	/* 157 (0x9d) */
++	0x00,	/* 158 (0x9e) */
++	0x00,	/* 159 (0x9f) */
++	0x00,	/* 160 (0xa0) */
++	0x00,	/* 161 (0xa1) */
++	0x00,	/* 162 (0xa2) */
++	0x00,	/* 163 (0xa3) */
++	0x00,	/* 164 (0xa4) */
++	0x00,	/* 165 (0xa5) */
++	0xea,	/* 166 (0xa6) - Lenovo page back <XF86Back> */
++	0xe9,	/* 167 (0xa7) - Lenovo page forward <XF86Forward> */
++	0x00,	/* 168 (0xa8) */
++	0x00,	/* 169 (0xa9) */
++	0x00,	/* 170 (0xaa) */
++	0x99,	/* 171 (0xab) - Lenovo Audio Next <XF86AudioNext> */
++	0xa2,	/* 172 (0xac) - Lenovo Audio Play <XF86AudioPlay> */
++	0x90,	/* 173 (0xad) - Lenovo Audio Prev <XF86AudioPrev> */
++	0xa4,	/* 174 (0xae) - Lenovo Audio Stop <XF86AudioStop> */
++	0x00,	/* 175 (0xaf) */
++	0x00,	/* 176 (0xb0) */
++	0x00,	/* 177 (0xb1) */
++	0x00,	/* 178 (0xb2) */
++	0x00,	/* 179 (0xb3) */
++	0x00,	/* 180 (0xb4) */
++	0x00,	/* 181 (0xb5) */
++	0x00,	/* 182 (0xb6) */
++	0x00,	/* 183 (0xb7) */
++	0x00,	/* 184 (0xb8) */
++	0x00,	/* 185 (0xb9) */
++	0x00,	/* 186 (0xba) */
++	0x00,	/* 187 (0xbb) */
++	0x00,	/* 188 (0xbc) */
++	0x00,	/* 189 (0xbd) */
++	0x00,	/* 190 (0xbe) */
++	0x00,	/* 191 (0xbf) */
++	0x00,	/* 192 (0xc0) */
++	0x00,	/* 193 (0xc1) */
++	0x00,	/* 194 (0xc2) */
++	0x00,	/* 195 (0xc3) */
++	0x00,	/* 196 (0xc4) */
++	0x00,	/* 197 (0xc5) */
++	0x00,	/* 198 (0xc6) */
++	0x00,	/* 199 (0xc7) */
++	0x00,	/* 200 (0xc8) */
++	0x00,	/* 201 (0xc9) */
++	0x00,	/* 202 (0xca) */
++	0x00,	/* 203 (0xcb) */
++	0x00,	/* 204 (0xcc) */
++	0x00,	/* 205 (0xcd) */
++	0x00,	/* 206 (0xce) */
++	0x00,	/* 207 (0xcf) */
++	0x00,	/* 208 (0xd0) */
++	0x00,	/* 209 (0xd1) */
++	0x00,	/* 210 (0xd2) */
++	0x00,	/* 211 (0xd3) */
++	0x00,	/* 212 (0xd4) */
++	0x00,	/* 213 (0xd5) */
++	0x00,	/* 214 (0xd6) */
++	0x00,	/* 215 (0xd7) */
++	0x00,	/* 216 (0xd8) */
++	0x00,	/* 217 (0xd9) */
++	0x00,	/* 218 (0xda) */
++	0x00,	/* 219 (0xdb) */
++	0x00,	/* 220 (0xdc) */
++	0x00,	/* 221 (0xdd) */
++	0x00,	/* 222 (0xde) */
++	0x00,	/* 223 (0xdf) */
++	0x00,	/* 224 (0xe0) */
++	0x00,	/* 225 (0xe1) */
++	0x00,	/* 226 (0xe2) */
++	0x00,	/* 227 (0xe3) */
++	0x00,	/* 228 (0xe4) */
++	0x00,	/* 229 (0xe5) */
++	0x00,	/* 230 (0xe6) */
++	0x00,	/* 231 (0xe7) */
++	0x00,	/* 232 (0xe8) */
++	0x00,	/* 233 (0xe9) */
++	0x00,	/* 234 (0xea) */
++	0x00,	/* 235 (0xeb) */
++	0x00,	/* 236 (0xec) */
++	0x00,	/* 237 (0xed) */
++	0x00,	/* 238 (0xee) */
++	0x00,	/* 239 (0xef) */
++	0x00,	/* 240 (0xf0) */
++	0x00,	/* 241 (0xf1) */
++	0x00,	/* 242 (0xf2) */
++	0x00,	/* 243 (0xf3) */
++	0x00,	/* 244 (0xf4) */
++	0x00,	/* 245 (0xf5) */
++	0x00,	/* 246 (0xf6) */
++	0x00,	/* 247 (0xf7) */
++	0x00,	/* 248 (0xf8) */
++	0x00,	/* 249 (0xf9) */
++	0x00,	/* 250 (0xfa) */
++	0x00,	/* 251 (0xfb) */
++	0x00,	/* 252 (0xfc) */
++	0x00,	/* 253 (0xfd) */
++	0x00,	/* 254 (0xfe) */
++	0x00	/* 255 (0xff) */
++};
++
++#endif
+diff --git a/vl.c b/vl.c
+index de8da99..57fdbd4 100644
+--- a/vl.c
++++ b/vl.c
+@@ -1994,6 +1994,11 @@ static DisplayType select_display(const char *p)
+         fprintf(stderr, "Curses support is disabled\n");
+         exit(1);
+ #endif
++    // The next 2 lines should be removed once orc-dm is changed to orc-ds
++    } else if (strstart(p, "orc-dm", &opts)) {
++        display = DT_ORC;
++    } else if (strstart(p, "orc-ds", &opts)) {
++        display = DT_ORC;
+     } else if (strstart(p, "none", &opts)) {
+         display = DT_NONE;
+     } else {
+@@ -4003,11 +4008,11 @@ int main(int argc, char **argv, char **envp)
+     if (display_type == DT_DEFAULT && !display_remote) {
+ #if defined(CONFIG_SDL) || defined(CONFIG_COCOA)
+         display_type = DT_SDL;
+-#elif defined(CONFIG_VNC)
++#elif 0
+         vnc_display = "localhost:0,to=99";
+         show_vnc_port = 1;
+ #else
+-        display_type = DT_NONE;
++        display_type = DT_ORC;
+ #endif
+     }
+ 
+@@ -4033,6 +4038,9 @@ int main(int argc, char **argv, char **envp)
+         cocoa_display_init(ds, full_screen);
+         break;
+ #endif
++    case DT_ORC:
++        orc_ds_init();
++        break;
+     default:
+         break;
+     }

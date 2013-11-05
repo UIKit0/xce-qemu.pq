@@ -1,0 +1,49 @@
+diff --git a/console.h b/console.h
+index 287dca7..fedfd76 100644
+--- a/console.h
++++ b/console.h
+@@ -109,7 +109,8 @@ void kbd_put_keysym(int keysym);
+ 
+ #define QEMU_BIG_ENDIAN_FLAG    0x01
+ #define QEMU_ALLOCATED_FLAG     0x02
+-#define QEMU_SHM_FLAG           0x04
++#define QEMU_SHM_FLAG           0x04 /* The buffer is posix shared memory */
++#define QEMU_INITIAL_FLAG	0x08 /* This is the first buffer attached to the DisplayState */
+ 
+ typedef enum {
+         GN_PNP, GN_MONITOR_PNP, GN_DISPLAY_CONFIG, GN_WINDOW_ID, GN_MIRROR_ID, GN_MOUSE_ENABLED
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index d0f13f8..3c5bbb1 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -563,6 +563,10 @@ static void orc_vga_update(void *opaque)
+         if (ds->vga_state == opaque && ds != s->ds) {
+             /* If there are any flags at all, we're not Xen memory. Do a full screen update. */
+             if (ds->surface->flags) {
++                if (ds->surface->flags |= QEMU_INITIAL_FLAG) {
++                    /* External displays that haven't had a mode-set are always blank. */
++                    continue;
++                }
+                 dpy_gfx_update(ds, 0, 0, ds_get_width(ds), ds_get_height(ds));
+             } else {
+                 uint32_t line;
+diff --git a/ui/orc-ds.c b/ui/orc-ds.c
+index ca5946d..18cb38e 100644
+--- a/ui/orc-ds.c
++++ b/ui/orc-ds.c
+@@ -253,6 +253,7 @@ do_remove_display(DisplayState *ds)
+         ds->surface = qemu_resize_displaysurface(ds,
+                                                  ds_get_width(ds),
+                                                  ds_get_height(ds));
++        ds->surface->flags |= QEMU_INITIAL_FLAG;
+     }
+ 
+     be_state.n_displays--;
+@@ -370,6 +371,7 @@ static DisplayState *orc_ds_display_create(uint8_t display_id, uint32_t width, u
+     }
+ 
+     ds->surface = qemu_create_displaysurface(ds, width, height);
++    ds->surface->flags |= QEMU_INITIAL_FLAG;
+ 
+     orc_ds_fs_init(ds);
+ 

@@ -1,0 +1,387 @@
+diff --git a/Makefile.objs b/Makefile.objs
+index fb7de3e..14aabd9 100644
+--- a/Makefile.objs
++++ b/Makefile.objs
+@@ -73,6 +73,7 @@ common-obj-y += qemu-pixman.o
+ common-obj-y += $(oslib-obj-y)
+ common-obj-$(CONFIG_WIN32) += os-win32.o
+ common-obj-$(CONFIG_POSIX) += os-posix.o
++common-obj-y += orc_log_util.o
+ 
+ common-obj-$(CONFIG_LINUX) += fsdev/
+ extra-obj-$(CONFIG_LINUX) += fsdev/
+diff --git a/exec.c b/exec.c
+index 8435de0..51f51cf 100644
+--- a/exec.c
++++ b/exec.c
+@@ -2026,7 +2026,7 @@ static int dump_region(void *priv, abi_ulong start,
+ {
+     FILE *f = (FILE *)priv;
+ 
+-    (void) fprintf(f, TARGET_ABI_FMT_lx"-"TARGET_ABI_FMT_lx
++    fprintf(f, TARGET_ABI_FMT_lx"-"TARGET_ABI_FMT_lx
+         " "TARGET_ABI_FMT_lx" %c%c%c\n",
+         start, end, end - start,
+         ((prot & PAGE_READ) ? 'r' : '-'),
+@@ -2039,7 +2039,7 @@ static int dump_region(void *priv, abi_ulong start,
+ /* dump memory mappings */
+ void page_dump(FILE *f)
+ {
+-    (void) fprintf(f, "%-8s %-8s %-8s %s\n",
++    fprintf(f, "%-8s %-8s %-8s %s\n",
+             "start", "end", "size", "prot");
+     walk_memory_regions(f, dump_region);
+ }
+diff --git a/linux-user/elfload.c b/linux-user/elfload.c
+index 1d8bcb4..7fa9680 100644
+--- a/linux-user/elfload.c
++++ b/linux-user/elfload.c
+@@ -2517,7 +2517,7 @@ static int core_dump_filename(const TaskState *ts, char *buf,
+     assert(bufsize >= PATH_MAX);
+ 
+     if (gettimeofday(&tv, NULL) < 0) {
+-        (void) fprintf(stderr, "unable to get current timestamp: %s",
++        fprintf(stderr, "unable to get current timestamp: %s",
+                        strerror(errno));
+         return (-1);
+     }
+@@ -2868,7 +2868,7 @@ static int elf_core_dump(int signr, const CPUArchState *env)
+              */
+             error = copy_from_user(page, addr, sizeof (page));
+             if (error != 0) {
+-                (void) fprintf(stderr, "unable to dump " TARGET_ABI_FMT_lx "\n",
++                fprintf(stderr, "unable to dump " TARGET_ABI_FMT_lx "\n",
+                                addr);
+                 errno = -error;
+                 goto out;
+diff --git a/linux-user/main.c b/linux-user/main.c
+index 25e35cd..d73ce46 100644
+--- a/linux-user/main.c
++++ b/linux-user/main.c
+@@ -3405,7 +3405,7 @@ int main(int argc, char **argv, char **envp)
+     qemu_cache_utils_init(envp);
+ 
+     if ((envlist = envlist_create()) == NULL) {
+-        (void) fprintf(stderr, "Unable to allocate envlist\n");
++        fprintf(stderr, "Unable to allocate envlist\n");
+         exit(1);
+     }
+ 
+@@ -3552,7 +3552,7 @@ int main(int argc, char **argv, char **envp)
+     target_argc = argc - optind;
+     target_argv = calloc(target_argc + 1, sizeof (char *));
+     if (target_argv == NULL) {
+-	(void) fprintf(stderr, "Unable to allocate memory for target_argv\n");
++	fprintf(stderr, "Unable to allocate memory for target_argv\n");
+ 	exit(1);
+     }
+ 
+diff --git a/linux-user/signal.c b/linux-user/signal.c
+index 95e2ffa..187c65e 100644
+--- a/linux-user/signal.c
++++ b/linux-user/signal.c
+@@ -407,7 +407,7 @@ static void QEMU_NORETURN force_sig(int target_sig)
+         getrlimit(RLIMIT_CORE, &nodump);
+         nodump.rlim_cur=0;
+         setrlimit(RLIMIT_CORE, &nodump);
+-        (void) fprintf(stderr, "qemu: uncaught target signal %d (%s) - %s\n",
++        fprintf(stderr, "qemu: uncaught target signal %d (%s) - %s\n",
+             target_sig, strsignal(host_sig), "core dumped" );
+     }
+ 
+diff --git a/orc_debug.h b/orc_debug.h
+index 6fe5eb4..8d667b2 100644
+--- a/orc_debug.h
++++ b/orc_debug.h
+@@ -1,3 +1,6 @@
++#ifndef ORC_DEBUG_H_
++#define ORC_DEBUG_H_
++
+ #include "qemu-log.h"
+ 
+ /*
+@@ -43,4 +46,11 @@ extern unsigned int orc_flags;
+ 
+ #define DPRINT(flags, fmt, ...) \
+     if (orc_flags & flags) \
+-        fprintf(logfile, "%s: "fmt, __func__, ## __VA_ARGS__)
++	    qemu_log("%s: "fmt, __func__, ## __VA_ARGS__)
++
++void
++orc_log_streams(FILE **streams[], int scount);
++void
++orc_log_stream(FILE **stream);
++
++#endif
+diff --git a/orc_log_util.c b/orc_log_util.c
+new file mode 100644
+index 0000000..c167afa
+--- /dev/null
++++ b/orc_log_util.c
+@@ -0,0 +1,114 @@
++#include "qemu-common.h"
++#include <syslog.h>
++
++#define LOG_BUF_SIZE 1024
++
++struct logstream_cookie {
++	char   *buf;        /* Buffer for data */
++	off_t   offset;     /* Current file offset in buf */
++};
++
++static ssize_t
++logstream_write(void *c, const char *buf, size_t size)
++{
++	struct logstream_cookie *cookie = c;
++	int buf_offset = 0;
++
++	while (size > 0) {
++
++		size_t chunk_sz;
++
++		if (size >= LOG_BUF_SIZE - cookie->offset) {
++			chunk_sz = LOG_BUF_SIZE - cookie->offset;
++		} else {
++			chunk_sz = size;
++		}
++
++		memcpy(cookie->buf + cookie->offset, &buf[buf_offset], chunk_sz);
++		cookie->offset += chunk_sz;
++		buf_offset += chunk_sz;
++
++		if ((cookie->buf[cookie->offset - 1] == '\n') ||
++		    (cookie->offset >= LOG_BUF_SIZE)) {
++			cookie->buf[cookie->offset] = '\0';
++			syslog(LOG_ERR, "%s", cookie->buf);
++			cookie->offset = 0;
++		}
++
++		size -= chunk_sz;
++	}
++
++	return buf_offset;
++}
++
++static int
++logstream_seek(void *cookie, off64_t *offset, int whence)
++{
++	return 0;
++}
++
++static ssize_t
++logstream_read(void *cookie, char *buf, size_t size)
++{
++	return 0;
++}
++
++static int
++logstream_close(void *c)
++{
++	struct logstream_cookie *cookie = c;
++
++	cookie->buf[cookie->offset] = '\0';
++	syslog(LOG_ERR, "%s", cookie->buf);
++	cookie->offset = 0;
++	free(cookie->buf);
++	cookie->buf = NULL;
++
++	return 0;
++}
++
++static FILE *fp = NULL;
++static struct logstream_cookie mycookie;
++static cookie_io_functions_t  logstream_func = {
++	.read  = &logstream_read,
++	.write = &logstream_write,
++	.seek  = &logstream_seek,
++	.close = &logstream_close
++};
++
++void
++orc_log_streams(FILE **streams[], int scount)
++{
++	int i;
++
++	/* Set up the cookie before calling fopencookie() */
++
++	mycookie.buf = malloc(LOG_BUF_SIZE);
++	if (mycookie.buf == NULL) {
++		perror("malloc");
++		exit(1);
++	}
++
++	mycookie.offset = 0;
++
++	if (fp == NULL) {
++		fp = fopencookie(&mycookie, "w+", logstream_func);
++		setlinebuf(fp);
++	}
++	if (fp == NULL) {
++		syslog(LOG_ERR, "fopencookie failed");
++		perror("fopencookie");
++		exit(1);
++	}
++
++	for (i = 0; i < scount; i++) {
++		fprintf(fp, "stream %p being redirected to syslog\n", streams[i]);
++		*streams[i] = fp;
++	}
++}
++
++void
++orc_log_stream(FILE **stream)
++{
++	orc_log_streams(&stream, 1);
++}
+diff --git a/qemu-error.c b/qemu-error.c
+index 7cd5ffe..b1710f6 100644
+--- a/qemu-error.c
++++ b/qemu-error.c
+@@ -12,6 +12,7 @@
+ 
+ #include <stdio.h>
+ #include "monitor.h"
++#include <syslog.h>
+ 
+ /*
+  * Print to current monitor if we have one, else to stderr.
+@@ -20,11 +21,14 @@
+  */
+ void error_vprintf(const char *fmt, va_list ap)
+ {
++#if 0
+     if (cur_mon) {
+         monitor_vprintf(cur_mon, fmt, ap);
+     } else {
+         vfprintf(stderr, fmt, ap);
+     }
++#endif
++    vsyslog(LOG_ERR, fmt, ap);
+ }
+ 
+ /*
+@@ -211,5 +215,5 @@ void error_report(const char *fmt, ...)
+     va_start(ap, fmt);
+     error_vprintf(fmt, ap);
+     va_end(ap);
+-    error_printf("\n");
++    error_printf("\n");   
+ }
+diff --git a/qemu-log.c b/qemu-log.c
+index a4c3d1f..80e3b4b 100644
+--- a/qemu-log.c
++++ b/qemu-log.c
+@@ -20,6 +20,8 @@
+ #include "qemu-common.h"
+ #include "qemu-log.h"
+ 
++#include <syslog.h>
++
+ #ifdef WIN32
+ static const char *logfilename = "qemu.log";
+ #else
+@@ -36,6 +38,8 @@ void qemu_log(const char *fmt, ...)
+     va_start(ap, fmt);
+     if (qemu_logfile) {
+         vfprintf(qemu_logfile, fmt, ap);
++    } else {
++        vsyslog(LOG_INFO, fmt, ap);
+     }
+     va_end(ap);
+ }
+diff --git a/vl.c b/vl.c
+index 15f7fe9..2c47ee5 100644
+--- a/vl.c
++++ b/vl.c
+@@ -170,6 +170,7 @@ int main(int argc, char **argv)
+ #include "ui/qemu-spice.h"
+ #include "qapi/string-input-visitor.h"
+ 
++#include "orc_debug.h"
+ #include "orc_rpc.h"
+ 
+ //#define DEBUG_NET
+@@ -279,6 +280,7 @@ static int default_cdrom = 1;
+ static int default_sdcard = 1;
+ static int default_vga = 1;
+ 
++#include <syslog.h>
+ #include "orc_rpc.h"
+ uint32_t orc_flags;
+ uint32_t screens = 0;
+@@ -2602,12 +2604,18 @@ int main(int argc, char **argv, char **envp)
+     };
+     const char *trace_events = NULL;
+     const char *trace_file = NULL;
++    FILE **stddescs[2];
+ 
+     main_wait("/etc/orc/main_spin_early");
+ 
+     atexit(qemu_run_exit_notifiers);
+     error_set_progname(argv[0]);
+ 
++    openlog(argv[0], LOG_NDELAY | LOG_PERROR | LOG_PID, LOG_LOCAL0);
++    stddescs[0] = &stdout;
++    stddescs[1] = &stderr;
++    orc_log_streams(stddescs, 2);
++
+     g_mem_set_vtable(&mem_trace);
+     if (!g_thread_supported()) {
+ #if !GLIB_CHECK_VERSION(2, 31, 0)
+@@ -3482,11 +3490,19 @@ int main(int argc, char **argv, char **envp)
+                 default_vga = 0;
+                 break;
+             case QEMU_OPTION_xen_domid:
+-                if (!(xen_available())) {
+-                    printf("Option %s not supported for this target\n", popt->name);
+-                    exit(1);
+-                }
+-                xen_domid = atoi(optarg);
++                {
++                    char *logname;
++                    if (!(xen_available())) {
++                        printf("Option %s not supported for this target\n", popt->name);
++                        exit(1);
++                    }
++                    xen_domid = atoi(optarg);
++		    /* Re-open syslog with the domain id in the name */
++		    logname = g_malloc(strlen(argv[0]) + strlen(optarg) + 2);
++		    sprintf(logname, "%s-%s", argv[0], optarg);
++		    closelog();
++		    openlog(logname, LOG_NDELAY | LOG_PERROR | LOG_PID, LOG_LOCAL0);
++		}
+                 break;
+             case QEMU_OPTION_xen_create:
+                 if (!(xen_available())) {
+@@ -4093,5 +4109,7 @@ int main(int argc, char **argv, char **envp)
+     net_cleanup();
+     res_free();
+ 
++    closelog();
++
+     return 0;
+ }
+diff --git a/xen-all.c b/xen-all.c
+index 046cc2a..af9e754 100644
+--- a/xen-all.c
++++ b/xen-all.c
+@@ -10,6 +10,7 @@
+ 
+ #include <sys/mman.h>
+ 
++#include "qemu-log.h"
+ #include "hw/pci.h"
+ #include "hw/pc.h"
+ #include "hw/xen_common.h"
+diff --git a/xen-mapcache.c b/xen-mapcache.c
+index 31c06dc..a4338e5 100644
+--- a/xen-mapcache.c
++++ b/xen-mapcache.c
+@@ -12,6 +12,7 @@
+ 
+ #include <sys/resource.h>
+ 
++#include "qemu-log.h"
+ #include "hw/xen_backend.h"
+ #include "blockdev.h"
+ #include "bitmap.h"

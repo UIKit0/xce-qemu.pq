@@ -1,0 +1,33 @@
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+index cb193f2..eb90371 100644
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -2454,9 +2454,11 @@ void __jit_debug_register_code(void)
+     asm("");
+ }
+ 
++#ifdef INCLUDE_JIT_DEBUG_DESCRIPTOR
+ /* Must statically initialize the version, because GDB may check
+    the version before we can set it.  */
+ struct jit_descriptor __jit_debug_descriptor = { 1, 0, 0, 0 };
++#endif
+ 
+ /* End GDB interface.  */
+ 
+@@ -2655,7 +2657,7 @@ static void tcg_register_jit_int(void *buf_ptr, size_t buf_size,
+         }
+     }
+ #endif
+-
++#ifdef INCLUDE_JIT_DEBUG_DESCRIPTOR
+     one_entry.symfile_addr = img;
+     one_entry.symfile_size = img_size;
+ 
+@@ -2663,6 +2665,7 @@ static void tcg_register_jit_int(void *buf_ptr, size_t buf_size,
+     __jit_debug_descriptor.relevant_entry = &one_entry;
+     __jit_debug_descriptor.first_entry = &one_entry;
+     __jit_debug_register_code();
++#endif
+ }
+ #else
+ /* No support for the feature.  Provide the entry point expected by exec.c,

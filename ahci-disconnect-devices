@@ -1,0 +1,31 @@
+diff --git a/hw/xen_platform.c b/hw/xen_platform.c
+index 94792d5..e607528 100644
+--- a/hw/xen_platform.c
++++ b/hw/xen_platform.c
+@@ -305,15 +305,25 @@ static void xen_platform_ioport_writeb(void *opaque, uint32_t addr, uint32_t val
+     case 0x11:
+         /* ORC - disable IDE disks */
+         if (val == 0x07) {
++            DeviceState *b;
+             fprintf(stderr,"%s: removing IDE disks\n", __FUNCTION__);
+             remove_ide_disks();
++            b = qdev_find_recursive(sysbus_get_default(), "ahci0");
++            if (b) {
++                qdev_unplug(b, NULL);
++            }
+         } else if (val == 0x08) {
+             fprintf(stderr,"%s: removing emulated NICS\n", __FUNCTION__);
+             pci_unplug_nics(s->pci_dev.bus);
+             net_cleanup();
+         } else if (val == 0x09) {
+-           fprintf(stderr,"%s: removing IDE disks and emulated NICS\n", __FUNCTION__);
++            DeviceState *b;
++            fprintf(stderr,"%s: removing IDE disks and emulated NICS\n", __FUNCTION__);
+             remove_ide_disks();
++            b = qdev_find_recursive(sysbus_get_default(), "ahci0");
++            if (b) {
++                qdev_unplug(b, NULL);
++            }
+             pci_unplug_nics(s->pci_dev.bus);
+             net_cleanup();
+         }

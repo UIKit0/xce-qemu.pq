@@ -1,0 +1,696 @@
+diff --git a/Makefile.objs b/Makefile.objs
+index 4412757..ae0d5d0 100644
+--- a/Makefile.objs
++++ b/Makefile.objs
+@@ -78,6 +78,7 @@ common-obj-y += block-migration.o iohandler.o
+ common-obj-y += pflib.o
+ common-obj-y += bitmap.o bitops.o
+ common-obj-y += page_cache.o
++common-obj-y += orc_rpc.o
+ 
+ common-obj-$(CONFIG_POSIX) += migration-exec.o migration-unix.o migration-fd.o
+ common-obj-$(CONFIG_WIN32) += version.o
+diff --git a/block_int.h b/block_int.h
+index 4452f6f..a3cf01a 100644
+--- a/block_int.h
++++ b/block_int.h
+@@ -456,4 +456,7 @@ void stream_start(BlockDriverState *bs, BlockDriverState *base,
+                   BlockDriverCompletionFunc *cb,
+                   void *opaque, Error **errp);
+ 
++int bdrv_get_physical_hint(BlockDriverState *bs);
++void bdrv_set_physical_hint(BlockDriverState *bs, int physical);
++
+ #endif /* BLOCK_INT_H */
+diff --git a/configure b/configure
+index bf1863e..1af2132 100755
+--- a/configure
++++ b/configure
+@@ -1401,6 +1401,7 @@ fi
+ # xen probe
+ 
+ if test "$xen" != "no" ; then
++  xen_libs=$QEMU_CFLAGS
+   xen_libs="-lxenstore -lxenctrl -lxenguest"
+ 
+   # First we test whether Xen headers and libraries are available.
+diff --git a/orc_debug.h b/orc_debug.h
+index abe4da4..6fe5eb4 100644
+--- a/orc_debug.h
++++ b/orc_debug.h
+@@ -1,3 +1,5 @@
++#include "qemu-log.h"
++
+ /*
+  * dynamic debug mask
+  */
+diff --git a/orc_rpc.c b/orc_rpc.c
+new file mode 100644
+index 0000000..d58db45
+--- /dev/null
++++ b/orc_rpc.c
+@@ -0,0 +1,591 @@
++#include "block_int.h"
++
++#include <errno.h>
++#include <unistd.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++
++#include "qemu_socket.h"
++#include "qemu_rpc.h"
++#include "orc_debug.h"
++#include "orc_rpc.h"
++#include "block_int.h"
++
++#define	QRPCMETH(s)	((struct qrpc_method *)((s)->buf + sizeof (int)))
++#define	QRPCRESP(s)	((struct qrpc_response *)((s)->buf + sizeof (int)))
++
++extern int xen_domid;
++int64_t last_activity;
++
++enum {
++	QRPC_READ_HEADER,
++	QRPC_READ_BODY,
++	QRPC_WRITE
++};
++
++typedef struct QRPCServerState {
++	int 	fd;
++} QRPCServerState;
++
++typedef struct QRPCState {
++	int 	fd;
++	int 	state;
++	int 	msglen;
++	int 	left;			/* number of bytes left to r/w */
++	char 	*bufp;			/* current r/w pointer into buf */
++	char 	buf[QRPC_MAX_SIZE];	/* pointer aligned since follows one */
++} QRPCState;
++
++static void qrpc_write_client(void *opaque);
++static void qrpc_close_client(QRPCState *s);
++
++static void
++send_response(QRPCState *s, size_t len)
++{
++	*(int *)s->buf = len;
++	s->bufp = s->buf;
++	s->left = len + sizeof (int);
++	s->state = QRPC_WRITE;
++
++	qemu_set_fd_handler(s->fd, NULL, qrpc_write_client, s);
++}
++
++static BlockDriverState *
++find_cdrom(void)
++{
++	BlockDriverState *bs = bdrv_find("ide1-cd0");
++
++	if (!bs)
++		bs = bdrv_find("ide1-cd0");
++
++	return bs;
++}
++
++static void
++handle_cdrom_change(QRPCState *s)
++{
++	struct qrpc_method *method = QRPCMETH(s);
++	const char *cdrom_file = (char *)method->data;
++	BlockDriverState *bs = find_cdrom();
++	struct qrpc_response *resp = QRPCRESP(s);
++
++	DPRINT(OF_DEBUG_RPC, "%s: ENTER\n", __func__);
++
++	if (bs) {
++		qemu_log("Changing virtual CD (backing file:%s)\n",
++			cdrom_file);
++
++		bdrv_close(bs);
++		bdrv_open(bs, cdrom_file, 0, NULL);
++	} else {
++		qemu_log("Virtual CD not found for media change\n");
++	}
++
++	resp->status = 0;
++	send_response(s, sizeof (*resp));
++}
++
++/* 
++ * Eject virtual CD
++ */
++static void
++handle_cdrom_eject(QRPCState *s)
++{
++	BlockDriverState *bs = find_cdrom();
++	struct qrpc_response *resp = QRPCRESP(s);
++
++	DPRINT(OF_DEBUG_RPC, "%s: \n", __func__);
++
++	if (bs) {
++		qemu_log("Ejecting virtual CD\n");
++
++		bdrv_close(bs);
++		resp->status = 0;
++	}
++	else
++		resp->status = ENXIO;
++
++	send_response(s, sizeof (*resp));
++}
++
++static void
++handle_video_mode_set(QRPCState *s)
++{
++	struct qrpc_method *method = QRPCMETH(s);
++	struct qrpc_response *resp = QRPCRESP(s);
++	struct qrpc_video_mode *vm = (struct qrpc_video_mode *)method->data;
++	int ret = 0;
++
++	if (s->msglen < sizeof (*method) + sizeof (*vm)) {
++		ret = EINVAL;
++	} else {
++#if 0
++		ret = display_pnp(vm->s_cmd, vm->s_mode);
++
++		DPRINT(OF_DEBUG_RPC, "%d %s ret %d\n",
++		       vm->s_cmd, vm->s_mode, ret);
++#endif
++	}
++	resp->status = ret;
++	send_response(s, sizeof (*resp));
++}
++
++static void
++handle_set_orc_flags(QRPCState *s)
++{
++	struct qrpc_orc_flags_method *method = 
++		(struct qrpc_orc_flags_method *)QRPCMETH(s);
++	struct qrpc_response *resp = QRPCRESP(s);
++	int ret = 0;
++
++	if (s->msglen < sizeof (*method))
++		ret = EINVAL;
++	else {
++		orc_flags = strtol(method->data, NULL, 0);
++		DPRINT(-1, "orc_flags 0x%x\n", orc_flags);
++	}
++#if 0
++	if (GET_OF_VIDEO_REFRESH()) {
++		display_refresh_interval = GET_OF_VIDEO_REFRESH();
++		DPRINT(-1, "Set display refresh interval to %d ms\n",
++		       display_refresh_interval);
++	}
++#endif
++	resp->status = ret;
++	send_response(s, sizeof (*resp));
++}
++
++static void
++handle_cycle_display(QRPCState *s)
++{
++	struct qrpc_method *method = QRPCMETH(s);
++	struct qrpc_response *resp = QRPCRESP(s);
++
++	DPRINT(OF_DEBUG_RPC, "%s Cycle display state\n", __func__);
++
++	if (s->msglen < sizeof (*method))
++		resp->status = EINVAL;
++#if 0
++	else
++		resp->status = display_cycle_event();
++#endif
++	
++	send_response(s, sizeof (*resp));
++}
++
++static void
++handle_crogl_enable(QRPCState *s)
++{
++	struct qrpc_method *method = QRPCMETH(s);
++	struct qrpc_response *resp = QRPCRESP(s);
++
++	DPRINT(OF_DEBUG_RPC, "%s\n", __func__);
++
++	if (s->msglen < sizeof (*method))
++		resp->status = EINVAL;
++#ifdef CONFIG_CROGL
++	else
++		resp->status = 0;
++	
++	crogl_enabled = 1;
++#endif
++	send_response(s, sizeof (*resp));
++}
++
++static void
++handle_crogl_disable(QRPCState *s)
++{
++	struct qrpc_method *method = QRPCMETH(s);
++	struct qrpc_response *resp = QRPCRESP(s);
++
++	DPRINT(OF_DEBUG_RPC, "%s\n", __func__);
++
++	if (s->msglen < sizeof (*method))
++		resp->status = EINVAL;
++#ifdef CONFIG_CROGL
++	else
++		resp->status = 0;
++	
++	crogl_enabled = 0;
++#endif
++	send_response(s, sizeof (*resp));
++}
++
++static void
++process_rpc(QRPCState *s)
++{
++	struct qrpc_response *resp;
++
++	if (s->msglen < sizeof (struct qrpc_method)) {
++		/* bad message, close connection */
++		DPRINT(OF_DEBUG_RPC, "msglen %d\n", s->msglen);
++		qrpc_close_client(s);
++	} else {
++		struct qrpc_method *method = QRPCMETH(s);
++
++		DPRINT(OF_DEBUG_RPC, "method %d\n", method->method);
++		switch (method->method) {
++		case QRPC_PM_CYCLE_DISPLAY:
++			handle_cycle_display(s);
++			break;
++		case QRPC_CD_EJECT:
++		case QRPC_CD_DETACH_ISO:
++			handle_cdrom_eject(s);
++			break;
++		case QRPC_CD_ATTACH_ISO:
++		case QRPC_CD_CHANGE:
++			handle_cdrom_change(s);
++			break;
++   		case QRPC_VIDEO_MODE_SET:
++   			handle_video_mode_set(s);
++   			break;
++   		case QRPC_ORC_FLAGS:
++   			handle_set_orc_flags(s);
++   			break;
++		case QRPC_CROGL_ENABLE:
++			handle_crogl_enable(s);
++			break;
++		case QRPC_CROGL_DISABLE:
++			handle_crogl_disable(s);
++			break;
++		default:
++			resp = QRPCRESP(s);
++			resp->status = EINVAL;
++			send_response(s, sizeof (*resp));
++		}
++	}
++}
++
++static void
++qrpc_read_client(void *opaque)
++{
++	QRPCState *s = opaque;
++	int r, totread;
++
++	r = recv(s->fd, s->bufp, s->left, 0);
++
++	DPRINT(OF_DEBUG_RPC, "%s: fd=%d, left=%d, r=%d\n", __func__,
++	    s->fd, s->left, r);
++
++	if (r <= 0) {
++		/* read error or eof, close connection */
++		qrpc_close_client(s);
++		return;
++	}
++
++	totread = s->bufp - s->buf + r;
++
++	if (s->state == QRPC_READ_HEADER) {
++		if (totread >= sizeof (int)) {
++			/* the message length has been read */
++			s->msglen = *(int *)s->buf;
++			s->left = s->msglen - (totread - sizeof(int));
++			s->state = QRPC_READ_BODY;
++		} else {
++			s->left -= r;
++		}
++	} else {
++		s->left -= r;
++        }
++
++	if (s->left == 0) {
++		process_rpc(s);
++	} else if (s->left < 0) {
++		/* invalid message */
++		qrpc_close_client(s);
++	} else {
++		s->bufp += r;
++	}
++}
++
++static void
++qrpc_write_client(void *opaque)
++{
++	QRPCState *s = opaque;
++	int r;
++
++	r = write(s->fd, s->bufp, s->left);
++
++	DPRINT(OF_DEBUG_RPC, "%s: fd=%d, left=%d, r=%d\n", __func__,
++	    s->fd, s->left, r);
++
++	if (((r < 0) && (errno != EINTR)) || (r == 0)) {
++		/* write error, close connection */
++		qrpc_close_client(s);
++	} else if (r > 0) {
++		s->left -= r;
++		if (s->left == 0) {
++			/* reset for next incoming message */
++			s->state = QRPC_READ_HEADER;
++			s->left = QRPC_MAX_SIZE;
++			s->bufp = s->buf;
++
++			qemu_set_fd_handler(s->fd, qrpc_read_client, NULL, s);
++		} else {
++			s->bufp += r;
++		}
++	}
++}
++
++static void
++qrpc_close_client(QRPCState *s)
++{
++	DPRINT(OF_DEBUG_RPC, "%s: fd=%d\n", __func__, s->fd);
++
++	qemu_set_fd_handler(s->fd, NULL, NULL, s);
++	closesocket(s->fd);
++	g_free(s);
++}
++
++static void
++qrpc_accept_client(void *opaque)
++{
++	QRPCServerState *ss = opaque;
++	QRPCState *s;
++	struct sockaddr remote;
++	int fd;
++	unsigned int len;
++
++	DPRINT(OF_DEBUG_RPC, "%s\n", __func__);
++
++	len = sizeof (remote);
++	if ((fd = accept(ss->fd, &remote, &len)) >= 0) {
++		if ((s = g_malloc0(sizeof (*s))) == NULL) {
++			close(fd);
++			return;
++		}
++
++		DPRINT(OF_DEBUG_RPC, "%s: fd=%d\n", __func__, fd);
++
++		s->fd = fd;
++		s->state = QRPC_READ_HEADER;
++		s->left = QRPC_MAX_SIZE;
++		s->bufp = s->buf;
++
++		qemu_set_fd_handler(s->fd, qrpc_read_client, NULL, s);
++	}
++}
++
++static int
++open_qrpc_server_socket(void)
++{
++	char sockname[sizeof (QRPC_SOCKET_TEMPLATE) + 16];
++	struct sockaddr_un local;
++	int fd, err;
++
++	snprintf(sockname, sizeof (sockname), QRPC_SOCKET_TEMPLATE, xen_domid);
++
++	if ((unlink(sockname) < 0) && (errno != ENOENT))
++		return (-1);
++
++	if ((fd = socket(PF_UNIX, SOCK_STREAM, 0)) < 0)
++		return (-1);
++
++	local.sun_family = AF_UNIX;
++	memset(local.sun_path, 0, sizeof (local.sun_path));
++	strncpy(local.sun_path, sockname, sizeof (local.sun_path));
++
++	if (bind(fd, (struct sockaddr *)&local, sizeof (local)) >= 0) {
++		if (listen(fd, 5) == 0)
++			return (fd);
++	}
++
++	err = errno;
++	close(fd);
++	errno = err;
++	return (-1);
++}
++
++int
++qrpc_init(void)
++{
++	QRPCServerState *ss;
++
++	if ((ss = g_malloc0(sizeof (*ss))) == NULL)
++		return (-1);
++
++	if ((ss->fd = open_qrpc_server_socket()) == -1) {
++		g_free(ss);
++		return (-1);
++	}
++
++	qemu_set_fd_handler(ss->fd, qrpc_accept_client, NULL, ss);
++
++	last_activity = qemu_get_clock_ms(rt_clock);
++	return (0);
++}
++
++
++/*
++ * RPC to mepd.
++ */
++
++#define	MEPD_SOCKET	"/tmp/mepd-socket"
++
++static void
++qrpc_read_server(void *opaque)
++{
++	QRPCState *s = opaque;
++	int r, totread;
++
++	r = recv(s->fd, s->bufp, s->left, 0);
++
++	DPRINT(OF_DEBUG_RPC, "%s: fd=%d, left=%d, r=%d\n", __func__,
++	    s->fd, s->left, r);
++
++	if (r <= 0) {
++		/* read error or eof, close connection */
++		qrpc_close_client(s);
++		return;
++	}
++
++	totread = s->bufp - s->buf + r;
++
++	if (s->state == QRPC_READ_HEADER) {
++		if (totread >= sizeof (int)) {
++			/* the message length has been read */
++			s->msglen = *(int *)s->buf;
++			s->left = s->msglen - (totread - sizeof(int));
++			s->state = QRPC_READ_BODY;
++		} else {
++			s->left -= r;
++		}
++	} else {
++		s->left -= r;
++        }
++
++	if (s->left <= 0) {
++		/*
++		 * Got the whole message or an invalid message.
++		 * In either case close connection discarding the message.
++		 */
++		qrpc_close_client(s);
++	} else {
++		s->bufp += r;
++	}
++}
++
++static void
++qrpc_write_server(void *opaque)
++{
++	QRPCState *s = opaque;
++	int r;
++
++	r = write(s->fd, s->bufp, s->left);
++
++	DPRINT(OF_DEBUG_RPC, "%s: fd=%d, left=%d, r=%d\n", __func__,
++	    s->fd, s->left, r);
++
++	if (((r < 0) && (errno != EINTR)) || (r == 0)) {
++		/* write error, close connection */
++		qrpc_close_client(s);
++	} else if (r > 0) {
++		s->left -= r;
++		if (s->left == 0) {
++			/* reset for response */
++			s->state = QRPC_READ_HEADER;
++			s->left = QRPC_MAX_SIZE;
++			s->bufp = s->buf;
++
++			qemu_set_fd_handler(s->fd, qrpc_read_server, NULL, s);
++		} else {
++			s->bufp += r;
++		}
++	}
++}
++
++static void
++qrpc_connected(void *opaque)
++{
++	QRPCState *s = opaque;
++
++	DPRINT(OF_DEBUG_RPC, "%s: fd=%d\n", __func__, s->fd);
++
++//	socket_set_block(s->fd);
++	qemu_set_fd_handler(s->fd, NULL, qrpc_write_server, s);
++}
++
++/*
++ * Signal mepd via a XML RPC request. Sends the request and then reads and
++ * discards the response.
++ */
++int
++qrpc_signal_mepd(char *xml_rpc_req, int req_len)
++{
++	struct sockaddr_un addr;
++	QRPCState *s;
++
++	if (req_len > QRPC_MAX_SIZE - sizeof (int))
++		return (EINVAL);
++
++	if ((s = g_malloc0(sizeof (*s))) == NULL)
++		return (-1);
++
++	if ((s->fd = socket(PF_UNIX, SOCK_STREAM, 0)) < 0) {
++		free(s);
++		return (-1);
++	}
++
++	DPRINT(OF_DEBUG_RPC, "%s: fd=%d, len=%d, req=\"%s\"\n", __func__,
++	    s->fd, req_len, xml_rpc_req);
++
++	addr.sun_family = AF_UNIX;
++	memset(addr.sun_path, 0, sizeof (addr.sun_path));
++	strncpy(addr.sun_path, MEPD_SOCKET, sizeof (addr.sun_path));
++
++	/* ensure the connect call does not block */
++	socket_set_nonblock(s->fd);
++
++	if (connect(s->fd, (struct sockaddr *)&addr, sizeof (addr)) < 0) {
++		if (errno != EINPROGRESS) {
++			free(s);
++			return (-1);
++		}
++	}
++
++	/*
++	 * Once the connect completes the socket will become write enabled.
++	 * Set a handler to write the request at that time.
++	 */
++
++	s->state = QRPC_WRITE;
++	s->left = sizeof (int) + req_len;
++	s->bufp = s->buf;
++	*(int *)s->buf = req_len;
++	memcpy(s->buf + sizeof (int), xml_rpc_req, req_len);
++
++	qemu_set_fd_handler(s->fd, NULL, qrpc_connected, s);
++
++	return 0;
++}
++
++#define EJECT_RPC							\
++	"<?xml version=\"1.0\"?><methodCall>"				\
++	"<methodName>cd_eject</methodName><params>"			\
++	"<param><value><int>%d</int></value></param></params></methodCall>"
++
++void
++qrpc_signal_cd_eject(void)
++{
++	char rpc[256];
++
++	DPRINT(OF_DEBUG_RPC, "%s\n", __func__);
++	snprintf(rpc, sizeof (rpc), EJECT_RPC, xen_domid);
++	qrpc_signal_mepd(rpc, strlen(rpc));
++}
++
++#define S_STATE_RPC							\
++	"<?xml version=\"1.0\"?><methodCall>"				\
++	"<methodName>s_state</methodName><params>"			\
++	"<param><value><int>%d</int></value></param></params></methodCall>"
++
++void
++qrpc_signal_s_state(qrpc_s_state_t state)
++{
++	char rpc[256];
++
++	DPRINT(OF_DEBUG_RPC, "%s\n", __func__);
++	snprintf(rpc, sizeof (rpc), S_STATE_RPC, (int)state);
++	qrpc_signal_mepd(rpc, strlen(rpc));
++}
+diff --git a/orc_rpc.h b/orc_rpc.h
+new file mode 100644
+index 0000000..bea4cfc
+--- /dev/null
++++ b/orc_rpc.h
+@@ -0,0 +1,15 @@
++#ifndef __ORC_RPC_H_
++#define __ORC_RPC_H_
++
++#include "qemu_rpc.h"
++#include "qemu-timer.h"
++
++extern int64_t last_activity;
++
++int qrpc_init(void);
++int qrpc_signal_mepd(char *xml_rpc_req, int req_len);
++void qrpc_signal_cd_eject(void);
++void qrpc_signal_s_state(qrpc_s_state_t state);
++
++#endif
++
+diff --git a/vl.c b/vl.c
+index 78b3720..644da62 100644
+--- a/vl.c
++++ b/vl.c
+@@ -169,6 +169,8 @@ int main(int argc, char **argv)
+ 
+ #include "ui/qemu-spice.h"
+ 
++#include "orc_rpc.h"
++
+ //#define DEBUG_NET
+ //#define DEBUG_SLIRP
+ 
+@@ -276,6 +278,8 @@ static int default_cdrom = 1;
+ static int default_sdcard = 1;
+ static int default_vga = 1;
+ 
++uint32_t orc_flags;
++
+ static struct {
+     const char *driver;
+     int *flag;
+@@ -3548,6 +3552,9 @@ int main(int argc, char **argv, char **envp)
+     }
+     configure_icount(icount_option);
+ 
++    /* Initialize the RPC server early to avoid race conditions */
++    qrpc_init();
++
+     if (net_init_clients() < 0) {
+         exit(1);
+     }

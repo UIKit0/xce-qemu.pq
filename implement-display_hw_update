@@ -1,0 +1,106 @@
+diff --git a/console.c b/console.c
+index 5494439..eafbd1f 100644
+--- a/console.c
++++ b/console.c
+@@ -209,6 +209,25 @@ void vga_hw_text_update(console_ch_t *chardata)
+         active_console->hw_text_update(active_console->hw, chardata);
+ }
+ 
++/* Multi-display, framebuffer only versions of the above vga_hw functions */
++void display_hw_update(DisplayState *ds)
++{
++    if (ds && ds->hw_update)
++        ds->hw_update(ds->vga_state);
++}
++
++void display_hw_invalidate(DisplayState *ds)
++{
++    if (ds && ds->hw_invalidate)
++        ds->hw_invalidate(ds->vga_state);
++}
++
++void display_hw_thumbnail_dump(DisplayState *ds, const char *filename)
++{
++    if (ds && ds->hw_thumbnail_dump)
++        ds->hw_thumbnail_dump(ds->vga_state, filename);
++}
++
+ /* convert a RGBA color to a color index usable in graphic primitives */
+ static unsigned int vga_get_color(DisplayState *ds, unsigned int rgba)
+ {
+@@ -1430,6 +1449,9 @@ DisplayState *graphic_console_init(vga_hw_update_ptr update,
+     s->hw_screen_dump = screen_dump;
+     s->hw_text_update = text_update;
+     s->hw = opaque;
++    ds->hw_update = update;
++    ds->hw_invalidate = invalidate;
++    ds->vga_state = opaque;
+ 
+     register_displaystate(ds);
+     return ds;
+diff --git a/console.h b/console.h
+index 5cd2f2e..7758eac 100644
+--- a/console.h
++++ b/console.h
+@@ -177,6 +177,9 @@ struct DisplayChangeListener {
+     void (*dpy_mouse_set)(struct DisplayState *s, int x, int y, int on);
+     void (*dpy_cursor_define)(struct DisplayState *s, QEMUCursor *cursor);
+     void (*hw_set_resolution)(void *opaque);
++    vga_hw_update_ptr hw_update;
++    vga_hw_invalidate_ptr hw_invalidate;
++    display_hw_thumbnail_dump_ptr hw_thumbnail_dump;
+ 
+     /* XXX FIX-ME - Ugly hack. Nothing outside of /hw should know
+        about PCI device state/VGA registers/etc. Have the edid code
+@@ -189,6 +192,26 @@ struct DisplayChangeListener {
+     QLIST_ENTRY(DisplayChangeListener) next;
+ };
+ 
++#ifdef CONFIG_CURSES
++#include <curses.h>
++typedef chtype console_ch_t;
++#else
++typedef unsigned long console_ch_t;
++#endif
++static inline void console_write_ch(console_ch_t *dest, uint32_t ch)
++{
++    if (!(ch & 0xff))
++        ch |= ' ';
++    *dest = ch;
++}
++
++typedef void (*vga_hw_update_ptr)(void *);
++typedef void (*vga_hw_invalidate_ptr)(void *);
++typedef void (*vga_hw_screen_dump_ptr)(void *, const char *,
++                                       Error **errp);
++typedef void (*vga_hw_text_update_ptr)(void *, console_ch_t *);
++typedef void (*display_hw_thumbnail_dump_ptr)(void *, const char *);
++
+ struct DisplayState {
+     struct DisplaySurface *surface;
+     void *opaque;
+@@ -458,12 +481,6 @@ static inline void console_write_ch(console_ch_t *dest, uint32_t ch)
+     *dest = ch;
+ }
+ 
+-typedef void (*vga_hw_update_ptr)(void *);
+-typedef void (*vga_hw_invalidate_ptr)(void *);
+-typedef void (*vga_hw_screen_dump_ptr)(void *, const char *, bool cswitch,
+-                                       Error **errp);
+-typedef void (*vga_hw_text_update_ptr)(void *, console_ch_t *);
+-
+ DisplayState *graphic_console_init(vga_hw_update_ptr update,
+                                    vga_hw_invalidate_ptr invalidate,
+                                    vga_hw_screen_dump_ptr screen_dump,
+@@ -474,6 +491,11 @@ void vga_hw_update(void);
+ void vga_hw_invalidate(void);
+ void vga_hw_text_update(console_ch_t *chardata);
+ 
++/* Multi-display, framebuffer only versions of the above vga_hw functions */
++void display_hw_update(DisplayState *ds);
++void display_hw_invalidate(DisplayState *ds);
++void display_hw_thumbnail_dump(DisplayState *ds, const char *filename);
++
+ int is_graphic_console(void);
+ int is_fixedsize_console(void);
+ CharDriverState *text_console_init(QemuOpts *opts);

@@ -1,0 +1,51 @@
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index dfb6361..f3d32e3 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -587,6 +587,13 @@ static void orc_vga_store_edid(DisplayState *ds, uint8_t *edid, size_t edid_size
+     if (ds->display_id < ORC_VGA_MAX_DISPLAYS && edid && edid_size) {
+         memcpy(vcp->display[ds->display_id].edid, edid, edid_size);
+     }
++
++    /* Squirrel away the port 0 EDID for vga bios DDC */
++    if (ds->display_id == 0) {
++        for (i = 0; i < edid_size; i++) {
++            s->vbe_edid[i] = edid[i];
++        }
++    }
+ }
+ 
+ static void orc_vga_set_orientation(DisplayState *ds, uint32_t x, uint32_t y, uint32_t r)
+diff --git a/hw/vga.c b/hw/vga.c
+index b97a91f..313154d 100644
+--- a/hw/vga.c
++++ b/hw/vga.c
+@@ -674,6 +674,8 @@ uint32_t vbe_ioport_read_data(void *opaque, uint32_t addr)
+         }
+     } else if (s->vbe_index == VBE_DISPI_INDEX_VIDEO_MEMORY_64K) {
+         val = s->vram_size / (64 * 1024);
++    } else if ((s->vbe_index & 0xFF00) == VBE_DISPI_DDC) {
++        val = s->vbe_edid[s->vbe_index & 0xFF];
+     } else {
+         val = 0;
+     }
+diff --git a/hw/vga_int.h b/hw/vga_int.h
+index 00d0ef2..1ff8448 100644
+--- a/hw/vga_int.h
++++ b/hw/vga_int.h
+@@ -47,6 +47,7 @@
+ #define VBE_DISPI_INDEX_Y_OFFSET        0x9
+ #define VBE_DISPI_INDEX_NB              0xa /* size of vbe_regs[] */
+ #define VBE_DISPI_INDEX_VIDEO_MEMORY_64K 0xa /* read-only, not in vbe_regs */
++#define VBE_DISPI_DDC                   0x4f00
+ 
+ #define VBE_DISPI_ID0                   0xB0C0
+ #define VBE_DISPI_ID1                   0xB0C1
+@@ -159,6 +160,7 @@ typedef struct VGACommonState {
+     uint32_t vbe_start_addr;
+     uint32_t vbe_line_offset;
+     uint32_t vbe_bank_mask;
++    uint8_t vbe_edid[256];
+     int vbe_mapped;
+     /* display refresh support */
+     DisplayState *ds;

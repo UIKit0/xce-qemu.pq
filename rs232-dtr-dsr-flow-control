@@ -1,0 +1,67 @@
+diff --git a/qemu-char.c b/qemu-char.c
+index f67a942..6cda8e7 100644
+--- a/qemu-char.c
++++ b/qemu-char.c
+@@ -547,6 +547,7 @@ static int stdio_nb_clients;
+ typedef struct {
+     int fd_in, fd_out;
+     int max_size;
++    int tiocoutq_failed;
+ } FDCharDriver;
+ 
+ 
+@@ -1020,6 +1021,18 @@ static CharDriverState *qemu_chr_open_pty(QemuOpts *opts)
+     return chr;
+ }
+ 
++static int tty_serial_write(CharDriverState *chr, const uint8_t *buf, int len)
++{
++    FDCharDriver *s = chr->opaque;
++    uint32_t inflight = 0;
++
++    qemu_chr_fe_ioctl(chr, CHR_IOCTL_SERIAL_TIOCOUTQ, &inflight);
++    if (inflight)
++        return -EAGAIN;
++
++    return send_all(s->fd_out, buf, len);
++}
++
+ static void tty_serial_init(int fd, int speed,
+                             int parity, int data_bits, int stop_bits)
+ {
+@@ -1197,6 +1210,15 @@ static int tty_serial_ioctl(CharDriverState *chr, int cmd, void *arg)
+             ioctl(s->fd_in, TIOCMSET, &targ);
+         }
+         break;
++    case CHR_IOCTL_SERIAL_TIOCOUTQ:
++        {
++            if (!s->tiocoutq_failed)
++                s->tiocoutq_failed = ioctl(s->fd_in, TIOCOUTQ, arg);
++
++            if (s->tiocoutq_failed)
++                *(unsigned int *)arg = 0;            
++        }
++        break;
+     default:
+         return -ENOTSUP;
+     }
+@@ -1231,6 +1253,7 @@ static CharDriverState *qemu_chr_open_tty(QemuOpts *opts)
+     }
+     tty_serial_init(fd, 115200, 'N', 8, 1);
+     chr = qemu_chr_open_fd(fd, fd);
++    chr->chr_write = tty_serial_write;
+     chr->chr_ioctl = tty_serial_ioctl;
+     chr->chr_close = qemu_chr_close_tty;
+     return chr;
+diff --git a/qemu-char.h b/qemu-char.h
+index 486644b..dedf5fd 100644
+--- a/qemu-char.h
++++ b/qemu-char.h
+@@ -42,6 +42,7 @@ typedef struct {
+ 
+ #define CHR_IOCTL_SERIAL_SET_TIOCM   13
+ #define CHR_IOCTL_SERIAL_GET_TIOCM   14
++#define CHR_IOCTL_SERIAL_TIOCOUTQ    15
+ 
+ #define CHR_TIOCM_CTS	0x020
+ #define CHR_TIOCM_CAR	0x040

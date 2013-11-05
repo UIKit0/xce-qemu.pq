@@ -1,0 +1,35 @@
+diff --git a/hw/pci.c b/hw/pci.c
+index 97a0cd7..8fb06ce 100644
+--- a/hw/pci.c
++++ b/hw/pci.c
+@@ -933,8 +933,8 @@ pcibus_t pci_get_bar_addr(PCIDevice *pci_dev, int region_num)
+     return pci_dev->io_regions[region_num].addr;
+ }
+ 
+-static pcibus_t pci_bar_address(PCIDevice *d,
+-				int reg, uint8_t type, pcibus_t size)
++pcibus_t pci_bar_address(PCIDevice *d,
++			 int reg, uint8_t type, pcibus_t size)
+ {
+     pcibus_t new_addr, last_addr;
+     int bar = pci_bar(d, reg);
+@@ -1037,7 +1037,7 @@ static inline int pci_irq_disabled(PCIDevice *d)
+ /* Called after interrupt disabled field update in config space,
+  * assert/deassert interrupts if necessary.
+  * Gets original interrupt disable bit value (before update). */
+-static void pci_update_irq_disabled(PCIDevice *d, int was_irq_disabled)
++void pci_update_irq_disabled(PCIDevice *d, int was_irq_disabled)
+ {
+     int i, disabled = pci_irq_disabled(d);
+     if (disabled == was_irq_disabled)
+diff --git a/hw/pci.h b/hw/pci.h
+index 4da0c2a..c2f008e 100644
+--- a/hw/pci.h
++++ b/hw/pci.h
+@@ -681,4 +681,6 @@ extern const VMStateDescription vmstate_pci_device;
+     .offset     = vmstate_offset_pointer(_state, _field, PCIDevice), \
+ }
+ 
++void pci_update_irq_disabled(PCIDevice *d, int was_irq_disabled);
++
+ #endif

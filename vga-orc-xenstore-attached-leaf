@@ -1,0 +1,52 @@
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index 5ae9387..ffcd2cc 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -645,6 +645,22 @@ static void orc_vga_update(void *opaque)
+     }
+ }
+ 
++
++void orc_vga_notify_xen_display_attached(DisplayState *ds, uint8_t val)
++{
++#if CONFIG_XEN_BACKEND
++    char path[64];
++
++    if (!xen_enabled())
++        return;
++
++    snprintf(path, sizeof(path), "/local/domain/%d/control/display/%d",
++            xen_domid, ds->display_id);
++
++    xenstore_write_int(path, "attached", val);
++#endif
++}
++
+ static void orc_vga_store_edid(DisplayState *ds, uint8_t *edid, size_t edid_size)
+ {
+     ORCVGAState *o = ds->vga_state;
+@@ -671,7 +687,14 @@ static void orc_vga_store_edid(DisplayState *ds, uint8_t *edid, size_t edid_size
+     }
+ 
+     if (ds->display_id < ORC_VGA_MAX_DISPLAYS && edid && edid_size) {
++        uint8_t null_edid[8] = { 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0 };
++        uint8_t valid = 1;
++
+         memcpy(vcp->display[ds->display_id].edid, edid, edid_size);
++        if (memcmp(edid, null_edid, 8) == 0) {
++            valid = 0;
++        }
++        orc_vga_notify_xen_display_attached(ds, valid);
+     }
+ 
+     /* Squirrel away the port 0 EDID for vga bios DDC */
+diff --git a/hw/vga-orc.h b/hw/vga-orc.h
+index 412c9f4..a4c587f 100644
+--- a/hw/vga-orc.h
++++ b/hw/vga-orc.h
+@@ -314,4 +314,5 @@ void orc_vga_notify(void *opaque, gn_cmd_t cmd, int value);
+ 
+ void orc_vga_notify_xen_guest_int(const char *leaf, int val);
+ void orc_vga_notify_xen_guest_orientation(DisplayState *ds, uint32_t x, uint32_t y, uint32_t r);
++void orc_vga_notify_xen_display_attached(DisplayState *ds, uint8_t val);
+ #endif

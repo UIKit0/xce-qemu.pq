@@ -1,0 +1,13 @@
+diff --git a/hw/vga.c b/hw/vga.c
+index e8f67a3..2922d69 100644
+--- a/hw/vga.c
++++ b/hw/vga.c
+@@ -349,6 +349,8 @@ static uint8_t vga_dumb_retrace(VGACommonState *s)
+ 
+ int vga_ioport_invalid(VGACommonState *s, uint32_t addr)
+ {
++    if (addr == 0x3da) return 0;
++
+     if (s->msr & VGA_MIS_COLOR) {
+         /* Color */
+         return (addr >= 0x3b0 && addr <= 0x3bf);

@@ -1,0 +1,56 @@
+diff --git a/hw/fw_cfg.h b/hw/fw_cfg.h
+index 619a394..73b4eef 100644
+--- a/hw/fw_cfg.h
++++ b/hw/fw_cfg.h
+@@ -27,6 +27,7 @@
+ #define FW_CFG_SETUP_SIZE       0x17
+ #define FW_CFG_SETUP_DATA       0x18
+ #define FW_CFG_FILE_DIR         0x19
++#define FW_CFG_SPLASH           0x1a
+ 
+ #define FW_CFG_FILE_FIRST       0x20
+ #define FW_CFG_FILE_SLOTS       0x10
+diff --git a/hw/pc.c b/hw/pc.c
+index 4ee39b3..4e683e7 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -621,6 +621,14 @@ static void *bochs_bios_init(void)
+     return fw_cfg;
+ }
+ 
++void orc_bios_init(void)
++{
++    void *fw_cfg;
++    fw_cfg = fw_cfg_init(BIOS_CFG_IOPORT, BIOS_CFG_IOPORT + 1, 0, 0);
++    init_splash_callback(fw_cfg);
++    rom_set_fw(fw_cfg);
++}
++
+ static long get_file_size(FILE *f)
+ {
+     long where, size;
+diff --git a/hw/pc.h b/hw/pc.h
+index 2237e86..e7e48fb 100644
+--- a/hw/pc.h
++++ b/hw/pc.h
+@@ -143,6 +143,7 @@ PCIBus *i440fx_init(PCII440FXState **pi440fx_state, int *piix_devfn,
+ /* piix4.c */
+ extern PCIDevice *piix4_dev;
+ int piix4_init(PCIBus *bus, ISABus **isa_bus, int devfn);
++void orc_bios_init(void);
+ 
+ /* vga.c */
+ enum vga_retrace_method {
+diff --git a/hw/pc_piix.c b/hw/pc_piix.c
+index db9f499..676bff7 100644
+--- a/hw/pc_piix.c
++++ b/hw/pc_piix.c
+@@ -117,6 +117,8 @@ static void pc_init1(MemoryRegion *system_memory,
+                        kernel_filename, kernel_cmdline, initrd_filename,
+                        below_4g_mem_size, above_4g_mem_size,
+                        rom_memory, &ram_memory);
++    } else {
++        orc_bios_init();
+     }
+ 
+     gsi_state = g_malloc0(sizeof(*gsi_state));

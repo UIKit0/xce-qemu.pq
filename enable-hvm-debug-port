@@ -1,0 +1,46 @@
+diff --git a/hw/pc.c b/hw/pc.c
+index 4e683e7..46eba4b 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -52,6 +52,8 @@
+ #include "arch_init.h"
+ #include "bitmap.h"
+ 
++#define DEBUG_BIOS
++
+ /* debug PC/ISA interrupts */
+ //#define DEBUG_IRQ
+ 
+@@ -525,6 +527,14 @@ static void handle_a20_line_change(void *opaque, int irq, int level)
+ /***********************************************************/
+ /* Bochs BIOS debug ports */
+ 
++static uint32_t bochs_bios_read(void *opaque, uint32_t addr) {
++	if (addr == 0x402)
++		return 0xaaaaaaaa;
++
++	return 0xffffffff;
++}
++
++
+ static void bochs_bios_write(void *opaque, uint32_t addr, uint32_t val)
+ {
+     static const char shutdown_str[8] = "Shutdown";
+@@ -624,6 +634,17 @@ static void *bochs_bios_init(void)
+ void orc_bios_init(void)
+ {
+     void *fw_cfg;
++
++    register_ioport_write(0x400, 1, 2, bochs_bios_write, NULL);
++    register_ioport_write(0x401, 1, 2, bochs_bios_write, NULL);
++    register_ioport_write(0x402, 1, 1, bochs_bios_write, NULL);
++    register_ioport_write(0x403, 1, 1, bochs_bios_write, NULL);
++
++    register_ioport_read(0x400, 1, 2, bochs_bios_read, NULL);
++    register_ioport_read(0x401, 1, 2, bochs_bios_read, NULL);
++    register_ioport_read(0x402, 1, 1, bochs_bios_read, NULL);
++    register_ioport_read(0x403, 1, 1, bochs_bios_read, NULL);
++
+     fw_cfg = fw_cfg_init(BIOS_CFG_IOPORT, BIOS_CFG_IOPORT + 1, 0, 0);
+     init_splash_callback(fw_cfg);
+     rom_set_fw(fw_cfg);

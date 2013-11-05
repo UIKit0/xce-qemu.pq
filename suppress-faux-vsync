@@ -1,0 +1,31 @@
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index 10a5ad4..d0f13f8 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -549,7 +549,7 @@ static void orc_vga_update(void *opaque)
+ 
+     if (vcp->feature_flags & FEATURE_WDDM_RECT_RB) {
+         orc_vga_update_from_rects(s, vcp);
+-        qemu_set_irq(o->dev.irq[0], 1);
++//        qemu_set_irq(o->dev.irq[0], 0);
+         return;
+     }
+ 
+@@ -557,7 +557,7 @@ static void orc_vga_update(void *opaque)
+     s->update(s);
+ 
+     /* VSYNC interrupt is for the primary display only */
+-    qemu_set_irq(o->dev.irq[0], 1);
++//    qemu_set_irq(o->dev.irq[0], 1);
+ 
+     for (ds = get_displaystate(); ds; ds = ds->next) {
+         if (ds->vga_state == opaque && ds != s->ds) {
+@@ -716,6 +716,8 @@ static int orc_vga_initfn(PCIDevice *dev)
+     pci_set_word(pci_conf + PCI_COMMAND, PCI_COMMAND_IO | PCI_COMMAND_MEMORY);
+ 
+     pci_set_long(pci_conf + PCI_INTERRUPT_PIN, 0x01);
++
++    qemu_set_irq(o->dev.irq[0], 0);
+  
+     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_MEM_PREFETCH, &s->vram);
+     

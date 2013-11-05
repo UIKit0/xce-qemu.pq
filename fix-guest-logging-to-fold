@@ -1,0 +1,123 @@
+diff --git a/hw/debugcon.c b/hw/debugcon.c
+index 14ab326..66e22b1 100644
+--- a/hw/debugcon.c
++++ b/hw/debugcon.c
+@@ -34,6 +34,7 @@
+ typedef struct DebugconState {
+     CharDriverState *chr;
+     uint32_t readback;
++    gboolean fprintf;
+ } DebugconState;
+ 
+ typedef struct ISADebugconState {
+@@ -51,7 +52,11 @@ static void debugcon_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+     printf("debugcon: write addr=0x%04x val=0x%02x\n", addr, val);
+ #endif
+ 
+-    qemu_chr_fe_write(s->chr, &ch, 1);
++    if (s->fprintf) {
++        fprintf(stderr, "%c", val);
++    } else {
++        qemu_chr_fe_write(s->chr, &ch, 1);
++    }
+ }
+ 
+ 
+@@ -69,8 +74,8 @@ static uint32_t debugcon_ioport_read(void *opaque, uint32_t addr)
+ static void debugcon_init_core(DebugconState *s)
+ {
+     if (!s->chr) {
+-        fprintf(stderr, "Can't create debugcon device, empty char device\n");
+-        exit(1);
++        s->fprintf = 1;
++        return;
+     }
+ 
+     qemu_chr_add_handlers(s->chr, NULL, NULL, NULL, s);
+diff --git a/hw/pc.c b/hw/pc.c
+index 71841d2..a64487d 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -534,42 +534,6 @@ static void handle_a20_line_change(void *opaque, int irq, int level)
+     cpu_x86_set_a20(cpu, level);
+ }
+ 
+-/***********************************************************/
+-/* Bochs BIOS debug ports */
+-
+-static uint32_t bochs_bios_read(void *opaque, uint32_t addr) {
+-	if (addr == 0x402)
+-		return 0xaaaaaaaa;
+-
+-	return 0xffffffff;
+-}
+-
+-
+-static void bochs_bios_write(void *opaque, uint32_t addr, uint32_t val)
+-{
+-    static const char shutdown_str[8] = "Shutdown";
+-    static int shutdown_index = 0;
+-
+-    switch(addr) {
+-    case 0x8900:
+-        /* same as Bochs power off */
+-        if (val == shutdown_str[shutdown_index]) {
+-            shutdown_index++;
+-            if (shutdown_index == 8) {
+-                shutdown_index = 0;
+-                qemu_system_shutdown_request();
+-            }
+-        } else {
+-            shutdown_index = 0;
+-        }
+-        break;
+-
+-    case 0x501:
+-    case 0x502:
+-        exit((val << 1) | 1);
+-    }
+-}
+-
+ int e820_add_entry(uint64_t address, uint64_t length, uint32_t type)
+ {
+     int index = le32_to_cpu(e820_table.count);
+@@ -595,12 +559,6 @@ static void *bochs_bios_init(void)
+     uint64_t *numa_fw_cfg;
+     int i, j;
+ 
+-    register_ioport_write(0x8900, 1, 1, bochs_bios_write, NULL);
+-
+-    register_ioport_write(0x501, 1, 1, bochs_bios_write, NULL);
+-    register_ioport_write(0x501, 1, 2, bochs_bios_write, NULL);
+-    register_ioport_write(0x502, 1, 2, bochs_bios_write, NULL);
+-
+     fw_cfg = fw_cfg_init(BIOS_CFG_IOPORT, BIOS_CFG_IOPORT + 1, 0, 0);
+ 
+     fw_cfg_add_i32(fw_cfg, FW_CFG_ID, 1);
+@@ -689,25 +647,11 @@ void orc_bios_init(void)
+ {
+     void *fw_cfg;
+ 
+-    register_ioport_write(0x400, 1, 2, bochs_bios_write, NULL);
+-    register_ioport_write(0x401, 1, 2, bochs_bios_write, NULL);
+-    register_ioport_write(0x402, 1, 1, bochs_bios_write, NULL);
+-    register_ioport_write(0x403, 1, 1, bochs_bios_write, NULL);
+-
+-    register_ioport_read(0x400, 1, 2, bochs_bios_read, NULL);
+-    register_ioport_read(0x401, 1, 2, bochs_bios_read, NULL);
+-    register_ioport_read(0x402, 1, 1, bochs_bios_read, NULL);
+-    register_ioport_read(0x403, 1, 1, bochs_bios_read, NULL);
+-
+-    fw_cfg = fw_cfg_init(BIOS_CFG_IOPORT, BIOS_CFG_IOPORT + 1, 0, 0);
+-
+-    fw_cfg_add_bytes(fw_cfg, FW_CFG_ACPI_TABLES, (uint8_t *)acpi_tables,
+-                     acpi_tables_len);
++    fw_cfg = bochs_bios_init();
+     fw_cfg_add_bytes(fw_cfg, FW_CFG_BIOS_SIG, (uint8_t *)biossig,
+                      biossig_len);
+ 
+     rom_set_fw(fw_cfg);
+-
+ }
+ 
+ static long get_file_size(FILE *f)

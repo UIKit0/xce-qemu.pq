@@ -1,0 +1,15 @@
+diff --git a/hw/pc.c b/hw/pc.c
+index 1cc3126..a3d8ad4 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -693,6 +693,10 @@ void orc_bios_init(void)
+ 
+     fw_cfg = fw_cfg_init(BIOS_CFG_IOPORT, BIOS_CFG_IOPORT + 1, 0, 0);
+     rom_set_fw(fw_cfg);
++
++    fw_cfg_add_bytes(fw_cfg, FW_CFG_ACPI_TABLES, (uint8_t *)acpi_tables,
++                     acpi_tables_len);
++
+ }
+ 
+ static long get_file_size(FILE *f)

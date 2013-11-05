@@ -1,0 +1,128 @@
+diff --git a/hw/ide/cmd646.c b/hw/ide/cmd646.c
+index bf8ece4..69a8ee7 100644
+--- a/hw/ide/cmd646.c
++++ b/hw/ide/cmd646.c
+@@ -292,6 +292,8 @@ static int pci_cmd646_ide_initfn(PCIDevice *dev)
+ 
+     vmstate_register(&dev->qdev, 0, &vmstate_ide_pci, d);
+     qemu_register_reset(cmd646_reset, d);
++
++    pci_ide_state = d;
+     return 0;
+ }
+ 
+diff --git a/hw/ide/pci.c b/hw/ide/pci.c
+index 88c0942..6705a22 100644
+--- a/hw/ide/pci.c
++++ b/hw/ide/pci.c
+@@ -33,6 +33,8 @@
+ 
+ #define BMDMA_PAGE_SIZE 4096
+ 
++PCIIDEState *pci_ide_state;
++
+ static void bmdma_start_dma(IDEDMA *dma, IDEState *s,
+                             BlockDriverCompletionFunc *dma_cb)
+ {
+@@ -473,6 +475,33 @@ static int ide_pci_post_load(void *opaque, int version_id)
+     return 0;
+ }
+ 
++void remove_ide_disks(void)
++{
++    PCIIDEState *d = pci_ide_state;
++    IDEState *s;
++    int bus, interface;
++
++    if (!d) {
++        fprintf(stderr, "%s: pci_ide_state is NULL!\n", __FUNCTION__);
++        return;
++    }
++
++    for (bus = 0; bus < 2; bus++) {
++        for (interface = 0; interface < 2; interface++) {
++            s = &d->bus[bus].ifs[interface];
++            if (!s->bs)
++                continue;
++            fprintf(stderr, "%s: removing drive bus %d interface %d\n",
++                __FUNCTION__, bus, interface);
++            if (bdrv_get_attached_dev(s->bs))
++                bdrv_detach_dev(s->bs, bdrv_get_attached_dev(s->bs));
++            bdrv_delete(s->bs);
++            s->bs = NULL;
++        }
++    }
++}
++
++
+ const VMStateDescription vmstate_ide_pci = {
+     .name = "ide",
+     .version_id = 3,
+diff --git a/hw/ide/pci.h b/hw/ide/pci.h
+index a694e54..c8c3d51 100644
+--- a/hw/ide/pci.h
++++ b/hw/ide/pci.h
+@@ -46,6 +46,7 @@ typedef struct PCIIDEState {
+     CMD646BAR cmd646_bar[2]; /* used only for cmd646 */
+ } PCIIDEState;
+ 
++extern PCIIDEState *pci_ide_state;
+ 
+ static inline IDEState *bmdma_active_if(BMDMAState *bmdma)
+ {
+@@ -60,4 +61,5 @@ extern MemoryRegionOps bmdma_addr_ioport_ops;
+ void pci_ide_create_devs(PCIDevice *dev, DriveInfo **hd_table);
+ 
+ extern const VMStateDescription vmstate_ide_pci;
++void remove_ide_disks(void);
+ #endif
+diff --git a/hw/ide/piix.c b/hw/ide/piix.c
+index bcaa400..1632291 100644
+--- a/hw/ide/piix.c
++++ b/hw/ide/piix.c
+@@ -161,6 +161,7 @@ static int pci_piix_ide_initfn(PCIDevice *dev)
+ 
+     pci_piix_init_ports(d);
+ 
++    pci_ide_state = d;
+     return 0;
+ }
+ 
+diff --git a/hw/xen_platform.c b/hw/xen_platform.c
+index 0214f37..02eb493 100644
+--- a/hw/xen_platform.c
++++ b/hw/xen_platform.c
+@@ -260,6 +260,8 @@ static uint32_t xen_platform_ioport_readb(void *opaque, uint32_t addr)
+     }
+ }
+ 
++void remove_ide_disks(void);
++
+ static void xen_platform_ioport_writeb(void *opaque, uint32_t addr, uint32_t val)
+ {
+     PCIXenPlatformState *s = opaque;
+@@ -271,6 +273,24 @@ static void xen_platform_ioport_writeb(void *opaque, uint32_t addr, uint32_t val
+     case 8:
+         log_writeb(s, val);
+         break;
++    case 0x11:
++        /* ORC - disable IDE disks */
++        if (val == 0x07) {
++            fprintf(stderr,"%s: removing IDE disks\n", __FUNCTION__);
++            remove_ide_disks();
++        } else if (val == 0x08) {
++            fprintf(stderr,"%s: removing emulated NICS\n", __FUNCTION__);
++            pci_unplug_nics(s->pci_dev.bus);
++            net_cleanup();
++        } else if (val == 0x09) {
++           fprintf(stderr,"%s: removing IDE disks and emulated NICS\n", __FUNCTION__);
++            remove_ide_disks();
++            pci_unplug_nics(s->pci_dev.bus);
++            net_cleanup();
++        }
++        fprintf(stderr, "%s: slowing down main loop\n", __FUNCTION__);
++//        gui_refresh_interval = display_refresh_interval;
++        break;
+     default:
+         break;
+     }

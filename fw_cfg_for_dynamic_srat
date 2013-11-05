@@ -1,0 +1,36 @@
+diff --git a/hw/pc.c b/hw/pc.c
+index b83e527..59959f6 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -963,7 +963,31 @@ void pc_cpus_init(const char *cpu_model)
+ void orc_bios_init(void)
+ {
+     void *fw_cfg;
++    uint64_t *numa_fw_cfg;
++    int i, j;
++
+     fw_cfg = fw_cfg_init(BIOS_CFG_IOPORT, BIOS_CFG_IOPORT + 1, 0, 0);
++
++    /* allocate memory for the NUMA channel: one (64bit) word for the number
++     * of nodes, one word for each VCPU->node and one word for each node to
++     * hold the amount of memory.
++     */
++    numa_fw_cfg = qemu_mallocz((1 + smp_cpus + nb_numa_nodes) * 8);
++    numa_fw_cfg[0] = cpu_to_le64(nb_numa_nodes);
++    for (i = 0; i < smp_cpus; i++) {
++        for (j = 0; j < nb_numa_nodes; j++) {
++            if (node_cpumask[j] & (1 << i)) {
++                numa_fw_cfg[i + 1] = cpu_to_le64(j);
++                break;
++            }
++        }
++    }
++    for (i = 0; i < nb_numa_nodes; i++) {
++        numa_fw_cfg[smp_cpus + 1 + i] = cpu_to_le64(node_mem[i]);
++    }
++    fw_cfg_add_bytes(fw_cfg, FW_CFG_NUMA, (uint8_t *)numa_fw_cfg,
++                     (1 + smp_cpus + nb_numa_nodes) * 8);
++
+     init_splash_callback(fw_cfg);
+     rom_set_fw(fw_cfg);
+ }

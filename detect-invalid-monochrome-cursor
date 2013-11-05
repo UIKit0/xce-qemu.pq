@@ -1,0 +1,157 @@
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index ffcd2cc..88a4540 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -356,13 +356,12 @@ static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
+ 
+     size_t data_len;
+     int and_mask_len;
+-    int i, j, bpp;
++    int i, bpp;
+ 
+     uint8_t cursor_data[ORC_VGA_CURSOR_SIZE_MAX];
+     uint32_t pixels[ORC_VGA_CURSOR_SIZE_MAX];
+     cursor_data_t *cursor;
+     QEMUCursor *qcursor;
+-            
+     uint16_t cursor_generation;
+ 
+     if (!o->foreign_fb_initialized)
+@@ -392,10 +391,10 @@ static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
+     cursor = (cursor_data_t *)cursor_data;
+ 
+     if (cursor->width == 0 || cursor->height == 0) {
+-        qemu_log("%s: ERROR - Invalid w(%d), h(%d) - "
+-                 "ignoring cursor\n",
++        qemu_log("%s: ERROR - Invalid w(%d) or h(%d) - "
++                 "setting default cursor\n",
+                  __FUNCTION__, cursor->width, cursor->height);
+-        return cursor_generation;
++        goto bad_cursor;
+     }
+ 
+     bpp = (cursor->width_in_bytes * 8) / cursor->width;
+@@ -404,13 +403,14 @@ static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
+ 
+     if (data_len & 3) {
+         qemu_log("%s: ERROR - HW Cursor length not divisible by 4. "
+-                 "Cursor will be garbled.", __FUNCTION__);
++                 "Cursor would be garbled.", __FUNCTION__);
++        goto bad_cursor;
+     }
+ 
+     if (data_len > ORC_VGA_CURSOR_SIZE_MAX) {
+-        qemu_log("%s: ERROR - HW Cursor length invalid (0x%zx) - retaining previous cursor",
++        qemu_log("%s: ERROR - HW Cursor length invalid (0x%zx) - setting default cursor",
+                  __FUNCTION__, data_len);
+-        return cursor_generation;
++        goto bad_cursor;
+     }
+ 
+     switch (bpp) {
+@@ -419,14 +419,27 @@ static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
+         for (i = 0; i < cursor->width * cursor->height; i++) {
+             uint8_t alpha;
+             uint32_t rgb;
++            uint8_t maskb = (1 << (7 - (i % 8)));
++            uint8_t andb = cursor->pixels[i / 8] & maskb;
++            uint8_t xorb = cursor->pixels[and_mask_len + (i / 8)] & maskb;
+ 
+             /*
+              * The first (width * height) bits of the buffer contain
+-             * the AND mask. If the pixel's bit in the AND mask is set
++             * the AND mask. If the pixel's bit in the AND mask is clear
+              * the pixel is opaque, otherwise it's transparent. 
+              * Translate the AND mask to 8-bit alpha data.
++             * Both bits set is not supported - in the windows world this
++             * indicates that the resulting bit should be inverted (the
++             * so-called xor cursor) which X cannot do. Convert to 50%
++             * transparent pixel
+              */
+-            if (cursor->pixels[i / 8] & (1 << (7 - (i % 8))))
++            if (andb & xorb) {
++                qemu_log("%s: ERROR - Invert HW Cursor not supported - setting default cursor",
++                         __FUNCTION__);
++                goto bad_cursor;
++            }
++
++            if (andb)
+                 alpha = 0x00;
+             else
+                 alpha = 0xFF;
+@@ -438,7 +451,7 @@ static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
+              *
+              * Set the RGB values as appropriate.
+              */
+-            if (cursor->pixels[and_mask_len + (i / 8)] & (1 << (7 - (i % 8))))
++            if (xorb)
+                 rgb = o->color_cursor ? 0xF2F200 : 0xFFFFFF;
+             else
+                 rgb = o->color_cursor ? 0xFF0000 : 0x000000;
+@@ -459,50 +472,33 @@ static uint16_t orc_vga_get_cursor(ORCVGAState *o, QEMUCursor **new_cursor)
+         break;
+     default:
+         /* Invalid calculated bpp */
+-        qemu_log("%s: ERROR - Invalid calculated bpp %d, orig wid %d\n",
++        qemu_log("%s: ERROR - Invalid calculated bpp %d, orig wid %d - "
++                 "setting default cursor\n",
+                  __FUNCTION__, bpp, cursor->width);
++        goto bad_cursor;
+     }
+ 
+-    /* Print out an ASCII art representation of the new cursor to syslog */
+-    if (orc_flags && OF_DEBUG_MOUSE) {
+-        fprintf (stderr, "New Mouse Cursor: WxH = %dx%d \n    ", cursor->width, cursor->height);
+-        for (j = 0; j < cursor->width; j++)
+-            fprintf(stderr, "-");
+-        fprintf(stderr, "\n");
+-        for (i = 0; i < cursor->height; i++) {
+-            fprintf(stderr, "%03d|", i);
+-            for (j = 0; j < cursor->width; j++) {
+-                char outc = ' ';
+-
+-                if (pixels[(i*cursor->width) + j] & 0xFF000000) {
+-
+-                    if ( (pixels[(i*cursor->width) + j] & 0xFFFF) >= 0x8888)
+-                        outc = '*';
+-                    else
+-                        outc = '.';
+-                }
+-
+-                if (i == cursor->hs_row && j == cursor->hs_col)
+-                    outc = 'o';
+-
+-                fprintf(stderr, "%c", outc);
+-            }
+-            fprintf(stderr, "|\n");
+-        }
+-        fprintf(stderr, "   ");
+-        for (j = 0; j < cursor->width; j++)
+-            fprintf(stderr, "-");
+-        fprintf(stderr, "\n");
+-    }
+-
++    /* Generate QEMU cursor from data */
+     qcursor = cursor_alloc(cursor->width, cursor->height);
+     qcursor->hot_x = cursor->hs_col;
+     qcursor->hot_y = cursor->hs_row;
+     memcpy(qcursor->data, pixels, cursor->width * cursor->height * 4);
+ 
++out:
++    /* Print out an ASCII art representation of the new cursor to syslog */
++    if (orc_flags && OF_DEBUG_MOUSE) {
++        fprintf (stderr, "New Mouse Cursor: WxH = %dx%d\n", qcursor->width, qcursor->height);
++        cursor_print_ascii_art(qcursor, "vga-orc");
++    }
++
+     *new_cursor = qcursor;
+ 
+     return cursor_generation;
++
++bad_cursor:
++    /* Use default left pointing cursor if guest gives us crap */
++    qcursor = cursor_builtin_left_ptr();
++    goto out;
+ }
+ 
+ static void orc_vga_update_cursor(ORCVGAState *o, vga_control_page_t *vcp)

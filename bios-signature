@@ -1,0 +1,168 @@
+diff --git a/arch_init.c b/arch_init.c
+index d8c2497..e3c0435 100644
+--- a/arch_init.c
++++ b/arch_init.c
+@@ -716,6 +716,16 @@ void do_acpitable_option(const char *optarg)
+ #endif
+ }
+ 
++void do_biossig_option(const char *optarg)
++{
++#ifdef TARGET_I386
++    if (biossig_add(optarg) < 0) {
++        fprintf(stderr, "Wrong BIOS sig provided\n");
++        exit(1);
++    }
++#endif
++}
++
+ void do_smbios_option(const char *optarg)
+ {
+ #ifdef TARGET_I386
+diff --git a/arch_init.h b/arch_init.h
+index c7cb94a..4816197 100644
+--- a/arch_init.h
++++ b/arch_init.h
+@@ -22,6 +22,7 @@ extern const uint32_t arch_type;
+ 
+ void select_soundhw(const char *optarg);
+ void do_acpitable_option(const char *optarg);
++void do_biossig_option(const char *optarg);
+ void do_smbios_option(const char *optarg);
+ void cpudef_init(void);
+ int audio_available(void);
+diff --git a/hw/pc.c b/hw/pc.c
+index a3d8ad4..9670771 100644
+--- a/hw/pc.c
++++ b/hw/pc.c
+@@ -72,6 +72,7 @@
+ #define FW_CFG_IRQ0_OVERRIDE (FW_CFG_ARCH_LOCAL + 2)
+ #define FW_CFG_E820_TABLE (FW_CFG_ARCH_LOCAL + 3)
+ #define FW_CFG_HPET (FW_CFG_ARCH_LOCAL + 4)
++#define FW_CFG_BIOS_SIG (FW_CFG_ARCH_LOCAL + 5)
+ 
+ #define MSI_ADDR_BASE 0xfee00000
+ 
+@@ -91,6 +92,9 @@ struct e820_table {
+ static struct e820_table e820_table;
+ struct hpet_fw_config hpet_cfg = {.count = UINT8_MAX};
+ 
++int biossig_len;
++char *biossig;
++
+ void gsi_handler(void *opaque, int n, int level)
+ {
+     GSIState *s = opaque;
+@@ -677,6 +681,50 @@ static void *bochs_bios_init(void)
+     return fw_cfg;
+ }
+ 
++int biossig_add(const char *t)
++{
++    char fname[1024], data[1024];
++    int len;
++
++    if (get_param_value(fname, sizeof(fname), "file", t)) {
++        int fd = open(fname, O_RDONLY);
++
++        if (fd < 0) {
++            fprintf(stderr, "can't open file %s: %s\n", fname, strerror(errno));
++            return -1;
++        }
++
++	len = read(fd, data, sizeof(data));
++
++	if (len < 0) {
++	    fprintf(stderr, "can't read file %s: %s\n", fname, strerror(errno));
++	    close(fd);
++	    return -1;
++	}
++
++	close(fd);
++
++	/* Strip trailing newline if found */
++	if (len > 0 && data[len-1] == '\n')
++	    len--;
++	if (len > 255)
++	    len = 255;
++
++	if (len) {
++	    /* Copy to ASCIC string */
++	    biossig = g_malloc0(len+1);
++	    biossig[0] = len;
++	    memcpy(biossig+1, data, len);
++	    biossig_len = len+1;
++	}
++
++	return 0;
++    } else {
++	fprintf(stderr, "Invalid option specified: %s\n", t);
++	return -1;
++    }
++}
++
+ void orc_bios_init(void)
+ {
+     void *fw_cfg;
+@@ -692,10 +740,13 @@ void orc_bios_init(void)
+     register_ioport_read(0x403, 1, 1, bochs_bios_read, NULL);
+ 
+     fw_cfg = fw_cfg_init(BIOS_CFG_IOPORT, BIOS_CFG_IOPORT + 1, 0, 0);
+-    rom_set_fw(fw_cfg);
+ 
+     fw_cfg_add_bytes(fw_cfg, FW_CFG_ACPI_TABLES, (uint8_t *)acpi_tables,
+                      acpi_tables_len);
++    fw_cfg_add_bytes(fw_cfg, FW_CFG_BIOS_SIG, (uint8_t *)biossig,
++                     biossig_len);
++
++    rom_set_fw(fw_cfg);
+ 
+ }
+ 
+diff --git a/hw/pc.h b/hw/pc.h
+index c782ee0..d6706da 100644
+--- a/hw/pc.h
++++ b/hw/pc.h
+@@ -130,6 +130,8 @@ void pc_pci_device_init(PCIBus *pci_bus);
+ typedef void (*cpu_set_smm_t)(int smm, void *arg);
+ void cpu_smm_register(cpu_set_smm_t callback, void *arg);
+ 
++int biossig_add(const char *t);
++
+ /* acpi.c */
+ extern int acpi_enabled;
+ extern char *acpi_tables;
+diff --git a/qemu-options.hx b/qemu-options.hx
+index edb98b0..5afaa51 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -1210,6 +1210,15 @@ portion of the table is used, all header information is specified in the
+ command line.
+ ETEXI
+ 
++DEF("biossig", HAS_ARG, QEMU_OPTION_biossig,
++    "-biossig file=file\n"
++    "                BIOS signature to add to BIOS text segment\n", QEMU_ARCH_I386)
++STEXI
++@item -biossig @var{file}
++@findex -biossig
++Specify file containing text to be added to the BIOS text segment.
++ETEXI
++
+ DEF("smbios", HAS_ARG, QEMU_OPTION_smbios,
+     "-smbios file=binary\n"
+     "                load SMBIOS entry from binary file\n"
+diff --git a/vl.c b/vl.c
+index 7ef6904..a3d79ce 100644
+--- a/vl.c
++++ b/vl.c
+@@ -3043,6 +3043,9 @@ int main(int argc, char **argv, char **envp)
+             case QEMU_OPTION_acpitable:
+                 do_acpitable_option(optarg);
+                 break;
++            case QEMU_OPTION_biossig:
++                do_biossig_option(optarg);
++                break;
+             case QEMU_OPTION_smbios:
+                 do_smbios_option(optarg);
+                 break;

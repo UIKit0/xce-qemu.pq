@@ -1,0 +1,22 @@
+diff --git a/hw/debugcon.c b/hw/debugcon.c
+index 66e22b1..3b1411c 100644
+--- a/hw/debugcon.c
++++ b/hw/debugcon.c
+@@ -49,11 +49,15 @@ static void debugcon_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+     unsigned char ch = val;
+ 
+ #ifdef DEBUG_DEBUGCON
+-    printf("debugcon: write addr=0x%04x val=0x%02x\n", addr, val);
++    printf("debugcon: write addr=0x%04x val=0x%02x ('%c')\n", addr, val,
++           (ch >= 0x20 && ch <= 0x7e) ? ch : '.');
+ #endif
+ 
+     if (s->fprintf) {
+-        fprintf(stderr, "%c", val);
++        /* Ignore NUL & DEL characters */
++        if (ch == 0 || ch == 0x7f)
++            return;
++        fprintf(stderr, "%c", ch);
+     } else {
+         qemu_chr_fe_write(s->chr, &ch, 1);
+     }

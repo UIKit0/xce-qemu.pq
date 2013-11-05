@@ -1,0 +1,13 @@
+diff --git a/ui/orc-ds.c b/ui/orc-ds.c
+index eaa4d12..4f04a46 100644
+--- a/ui/orc-ds.c
++++ b/ui/orc-ds.c
+@@ -226,7 +226,7 @@ static int orc_ds_ack_connection_cb(NxBackend *be, void *closure, int instance)
+ 
+     qemu_log("%s: instance = %d\n", __func__, instance);
+ 
+-    NxGuestInfo(be_state.be, buffer, display_name);
++    NxGuestInfo(be_state.be, xen_domid, buffer, display_name);
+ 
+     return (0);
+ }

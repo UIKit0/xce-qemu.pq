@@ -1,0 +1,38 @@
+diff --git a/cpu-common.h b/cpu-common.h
+index eee1435..8fef635 100644
+--- a/cpu-common.h
++++ b/cpu-common.h
+@@ -38,7 +38,7 @@ typedef uint32_t CPUReadMemoryFunc(void *opaque, hwaddr addr);
+ 
+ void qemu_ram_remap(ram_addr_t addr, ram_addr_t length);
+ #ifdef CONFIG_XEN
+-uint8_t *xen_map_memory(target_phys_addr_t addr, target_phys_addr_t size);
++uint8_t *xen_map_memory(ram_addr_t addr, ram_addr_t size);
+ #endif
+ 
+ /* This should only be used for ram local to a device.  */
+diff --git a/xen-all.c b/xen-all.c
+index a697afe..94d396a 100644
+--- a/xen-all.c
++++ b/xen-all.c
+@@ -158,9 +158,9 @@ qemu_irq *xen_interrupt_controller_init(void)
+ #define LOG_UNMAPPED_PAGES 0
+ 
+ /* Memory Ops */
+-uint8_t *xen_map_memory(target_phys_addr_t addr, target_phys_addr_t size)
++uint8_t *xen_map_memory(ram_addr_t addr, ram_addr_t size)
+ {
+-    target_phys_addr_t nb_pfn = size >> XC_PAGE_SHIFT;
++    ram_addr_t nb_pfn = size >> XC_PAGE_SHIFT;
+     uint8_t *ret;
+     unsigned long *err_bits;
+     int err_bits_longs = (nb_pfn + 63)/64;
+@@ -539,7 +539,7 @@ static void xen_sync_dirty_bitmap(XenIOState *state,
+                                  bitmap);
+     if (rc < 0) {
+         if (rc != -ENODATA) {
+-            memory_region_set_dirty(framebuffer, 0, size);
++            memory_region_set_dirty(&ram_memory, start_addr, size);
+             DPRINTF("xen: track_dirty_vram failed (0x" TARGET_FMT_plx
+                     ", 0x" TARGET_FMT_plx "): %s\n",
+                     start_addr, start_addr + size, strerror(-rc));

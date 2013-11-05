@@ -1,0 +1,20 @@
+diff --git a/console.h b/console.h
+index 36338ac..a84c9fd 100644
+--- a/console.h
++++ b/console.h
+@@ -209,6 +209,7 @@ struct DisplayState {
+     void (*mouse_set)(int x, int y, int on);
+     void (*cursor_define)(QEMUCursor *cursor);
+     void (*hw_set_resolution)(void *opaque);
++    void (*hw_store_edid)(void *opaque, uint8_t *edid, size_t edid_size);
+     vga_hw_update_ptr hw_update;
+     vga_hw_invalidate_ptr hw_invalidate;
+     display_hw_thumbnail_dump_ptr hw_thumbnail_dump;
+@@ -219,6 +220,7 @@ struct DisplayState {
+        pointer to push stuff in */
+     void *vga_state;
+ 
++    uint32_t display_id;
+     struct DisplayState *next;
+ };
+ 

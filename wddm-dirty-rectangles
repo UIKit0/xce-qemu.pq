@@ -1,0 +1,144 @@
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index 5d8f442..65adb28 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -153,10 +153,11 @@ static void orc_vga_write_config(PCIDevice *d,
+                 orc_vga_map(d, bar_addr, vga_ram_size());
+ 
+             if (po->foreign_fb_initialized) {
++                memset(s->vram_ptr, 0, vga_ram_size());
+                 vcp = GET_VCP((uint8_t *)s->vram_ptr);
++                memcpy(vcp->supported_modes, orc_supported_modes, sizeof(orc_supported_modes));
+                 vcp->host_magic = ORC_VGA_MAGIC;
+                 vcp->version = ORC_VGA_REVISION;
+-                memcpy(vcp->supported_modes, orc_supported_modes, sizeof(orc_supported_modes));
+             }
+             for (ds = get_displaystate(); ds; ds = ds->next) {
+                 if (ds->vga_state == po) {
+@@ -204,7 +205,7 @@ static void orc_vga_set_resolution(void *opaque)
+         return;
+ 
+     /* Non-VGA displays work differently */
+-    if (display_id > 0) {
++    if ((display_id > 0) || (vcp->feature_flags & FEATURE_WDDM_RECT_RB)) {
+ 
+         if (ds_get_data(ds)) {
+                 qemu_free_displaysurface(ds);
+@@ -505,6 +506,31 @@ static void orc_vga_update_cursor(ORCVGAState *o, vga_control_page_t *vcp)
+     }
+ }
+ 
++static void orc_vga_update_from_rects(VGACommonState *s, vga_control_page_t *vcp)
++{
++    DisplayState *dss[ORC_VGA_MAX_DISPLAYS];
++    DisplayState *ds;
++    uint32_t count = 0;
++
++    memset(dss, 0, sizeof(dss));
++
++    for (ds = get_displaystate(); ds; ds = ds->next) {
++        dss[ds->display_id] = ds;
++    }
++
++    while (!RECT_RING_EMPTY(vcp->rectrb) && count < XCE_MAX_RECTS) {
++        xce_rect *rect = &vcp->rectrb.rects[RECT_RING_READ_INDEX(vcp->rectrb)];
++
++        if(rect->id < ORC_VGA_MAX_DISPLAYS && dss[rect->id]) {
++            dpy_gfx_update(dss[rect->id], rect->rect.left, rect->rect.top,
++                           rect->rect.right - rect->rect.left,
++                           rect->rect.bottom - rect->rect.top);
++        }
++        vcp->rectrb.tail++;
++        count++;
++    }
++}
++
+ static void orc_vga_update(void *opaque)
+ {
+     ORCVGAState *o = opaque;
+@@ -515,6 +541,13 @@ static void orc_vga_update(void *opaque)
+     orc_vga_set_resolution(o);
+ 
+     orc_vga_update_cursor(o, vcp);
++
++    if (vcp->feature_flags & FEATURE_WDDM_RECT_RB) {
++        orc_vga_update_from_rects(s, vcp);
++        qemu_set_irq(o->dev.irq[0], 1);
++        return;
++    }
++
+     /* vga_draw_graphic() will call sync_dirty for us */
+     s->update(s);
+ 
+diff --git a/hw/vga-orc.h b/hw/vga-orc.h
+index 044c19c..996a6af 100644
+--- a/hw/vga-orc.h
++++ b/hw/vga-orc.h
+@@ -83,6 +83,51 @@ typedef struct display_data
+     uint32_t    fb_offset;       // DOMU writes, DOM0 reads. where this port's fb region starts.
+ } display_data_t;
+ 
++#define WDDM_RECT_LIST 1
++#if WDDM_RECT_LIST
++//
++// This uses the windows RECT structure, defined as follows:
++//
++typedef struct tagRECT
++{
++     int32_t    left;
++     int32_t    top;
++     int32_t    right;
++     int32_t    bottom;
++} RECT;
++//
++// Note that values will never be <0 and all are relative to the fb region defined
++// by "offset" in the xce_rect below.
++//
++typedef struct _xce_rect
++{
++    uint32_t id;
++    RECT     rect;
++} xce_rect;
++
++//
++// dirty rect lists appear to max out at a rate of 200 or so per second and
++// the reader is draining the list 30x/s so 64 should be more than sufficient.
++// If not there should be room for up to 512. (790 to be precise.)
++//
++// Reduce to 32 or 16 for testing boundary conditions? Consider
++// setting the number of elements in the xce_rect_rb itself, and
++// using XCE_MAX_RECTS as the limit.
++//
++#define XCE_MAX_RECTS 128
++typedef struct _xce_rect_rb
++{
++    int32_t head;
++    int32_t tail;
++    xce_rect rects[XCE_MAX_RECTS];
++} xce_rect_rb;
++
++#define RECT_RING_COUNT(rb) (rb.head - rb.tail)
++#define RECT_RING_FULL(rb) (RECT_RING_COUNT(rb) >= XCE_MAX_RECTS)
++#define RECT_RING_EMPTY(rb) (RECT_RING_COUNT(rb) <= 0)
++#define RECT_RING_READ_INDEX(rb) ((uint32_t)rb.tail % XCE_MAX_RECTS)
++#define RECT_RING_WRITE_INDEX(rb) ((uint32_t)rb.head % XCE_MAX_RECTS)
++#endif
+ 
+ typedef struct vga_control_page {
+ 
+@@ -115,8 +160,13 @@ typedef struct vga_control_page {
+             volatile uint16_t        cursor_generation;   /* IN: Odd for update-in-progress, even for update-complete */
+             volatile pcibus_t        animated_cursor_ptr; /* IN: Non-NULL if the cursor is a .ANI file located at this address */
+             uint8_t         nPorts;              /* IN: number of ports configured by DOMU. <= ORC_VGA_MAX_DISPLAYS */
+-            uint8_t         pad[6];              /* For alignment of cursor_data and edid */
+-            volatile uint8_t         cursor_data[ORC_VGA_CURSOR_SIZE_MAX]; /* IN: Raw cursor data */
++#define FEATURE_WDDM_RECT_RB 0x01
++            uint8_t         feature_flags;
++            uint8_t         pad[5];              /* For alignment of cursor_data and edid */
++            uint8_t         cursor_data[ORC_VGA_CURSOR_SIZE_MAX]; /* IN: Raw cursor data */
++#if WDDM_RECT_LIST
++            xce_rect_rb     rectrb;
++#endif
+           };
+           uint8_t pad_edid[ORC_VGA_EDID_OFFSET];
+         };

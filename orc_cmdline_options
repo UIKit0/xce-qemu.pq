@@ -1,0 +1,98 @@
+diff --git a/orc_rpc.c b/orc_rpc.c
+index d58db45..b1d50d3 100644
+--- a/orc_rpc.c
++++ b/orc_rpc.c
+@@ -17,6 +17,9 @@
+ 
+ extern int xen_domid;
+ int64_t last_activity;
++char domain_name[64] = "Xen-no-name";
++char display_name[64] = "Unnamed Guest";
++unsigned int opengl_enabled = 1;
+ 
+ enum {
+ 	QRPC_READ_HEADER,
+diff --git a/orc_rpc.h b/orc_rpc.h
+index bea4cfc..c8fc871 100644
+--- a/orc_rpc.h
++++ b/orc_rpc.h
+@@ -5,6 +5,9 @@
+ #include "qemu-timer.h"
+ 
+ extern int64_t last_activity;
++extern char domain_name[];
++extern char display_name[];
++extern unsigned int opengl_enabled;
+ 
+ int qrpc_init(void);
+ int qrpc_signal_mepd(char *xml_rpc_req, int req_len);
+diff --git a/qemu-options.hx b/qemu-options.hx
+index 8b66264..73b7c6f 100644
+--- a/qemu-options.hx
++++ b/qemu-options.hx
+@@ -6,6 +6,22 @@ HXCOMM construct option structures, enums and help message for specified
+ HXCOMM architectures.
+ HXCOMM HXCOMM can be used for comments, discarded from both texi and C
+ 
++DEFHEADING(ORC Options:)
++STEXI
++@table @option
++ETEXI
++
++DEF("domainname", HAS_ARG, QEMU_OPTION_domainname,
++ "-domain-name domain-name    set the NxTop domain name for this VM\n", QEMU_ARCH_ALL)
++DEF("displayname", HAS_ARG, QEMU_OPTION_displayname,
++ "-display-name display-name  set the user friendly name for this NxTop domain\n", QEMU_ARCH_ALL)
++DEF("disable-opengl", 0, QEMU_OPTION_disable_opengl,
++ "-disable-opengl                 don't use OpenGL for guest video\n", QEMU_ARCH_ALL)
++DEF("screen", HAS_ARG, QEMU_OPTION_screen,
++ "-screen                 Initial screen(s) configuration\n", QEMU_ARCH_ALL)
++DEF("orc-flags", HAS_ARG, QEMU_OPTION_orc_flags,
++ "-orc-flags                 Value for orc_flags\n", QEMU_ARCH_ALL)
++
+ DEFHEADING(Standard options:)
+ STEXI
+ @table @option
+diff --git a/vl.c b/vl.c
+index cbf7492..150474d 100644
+--- a/vl.c
++++ b/vl.c
+@@ -81,7 +81,11 @@
+ #endif
+ #endif
+ 
++#include "orc_rpc.h"
+ uint32_t orc_flags;
++uint32_t screens = 0;
++#define MAX_DISPLAYS 2
++char *screen_strings[MAX_DISPLAYS];
+ 
+ #if defined(__OpenBSD__)
+ #include <util.h>
+@@ -3252,6 +3256,26 @@ int main(int argc, char **argv, char **envp)
+             case QEMU_OPTION_qtest_log:
+                 qtest_log = optarg;
+                 break;
++            case QEMU_OPTION_domainname:
++                snprintf(domain_name, 64,
++                         "Xen-%s", optarg);
++                break;
++            case QEMU_OPTION_displayname:
++                snprintf(display_name, 64,
++                         "%s", optarg);
++                break;
++            case QEMU_OPTION_disable_opengl:
++                opengl_enabled = 0;
++                break;
++            case QEMU_OPTION_screen:
++                if (screens >= MAX_DISPLAYS)
++			break;
++                screen_strings[screens] = g_strdup(optarg);
++                screens++;
++		break;
++            case QEMU_OPTION_orc_flags:
++                orc_flags = atoi(optarg);
++                break;
+             default:
+                 os_parse_cmd_args(popt->index, optarg);
+             }

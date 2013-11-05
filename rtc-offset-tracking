@@ -1,0 +1,82 @@
+diff --git a/xen-all.c b/xen-all.c
+index 69900a0..331652e 100644
+--- a/xen-all.c
++++ b/xen-all.c
+@@ -82,6 +82,7 @@ typedef struct XenIOState {
+     CPUPhysMemoryClient client;
+     QLIST_HEAD(, XenPhysmap) physmap;
+     const XenPhysmap *log_for_dirtybit;
++    char *domain_path;
+ 
+     Notifier exit;
+ } XenIOState;
+@@ -709,7 +710,21 @@ static void cpu_ioreq_move(ioreq_t *req)
+     }
+ }
+ 
+-static void handle_ioreq(ioreq_t *req)
++static void cpu_ioreq_timeoffset(XenIOState *state, ioreq_t *req)
++{
++    char b[64];
++    char path[256];
++    unsigned long time_offset = (unsigned long)req->data;
++
++    qemu_log("Time offset for %d set to %ld\n", xen_domid, time_offset);
++
++    sprintf(b, "%ld", time_offset);
++    snprintf(path, sizeof(path), "%s/rtc/timeoffset", state->domain_path);
++    if (!xs_write(state->xenstore, XBT_NULL, path, b, strlen(b)))
++	qemu_log("Error writing RTC timeoffset %s to xenstore", b);
++}
++
++static void handle_ioreq(XenIOState *state, ioreq_t *req)
+ {
+     if (!req->data_is_ptr && (req->dir == IOREQ_WRITE) &&
+             (req->size < sizeof (target_ulong))) {
+@@ -724,6 +739,7 @@ static void handle_ioreq(ioreq_t *req)
+             cpu_ioreq_move(req);
+             break;
+         case IOREQ_TYPE_TIMEOFFSET:
++	    cpu_ioreq_timeoffset(state, req);
+             break;
+         case IOREQ_TYPE_INVALIDATE:
+             break;
+@@ -761,7 +777,7 @@ static void handle_buffered_iopage(XenIOState *state)
+             req.data |= ((uint64_t)buf_req->data) << 32;
+         }
+ 
+-        handle_ioreq(&req);
++        handle_ioreq(state, &req);
+ 
+         xen_mb();
+         state->buffered_io_page->read_pointer += qw ? 2 : 1;
+@@ -784,7 +800,7 @@ static void cpu_handle_ioreq(void *opaque)
+ 
+     handle_buffered_iopage(state);
+     if (req) {
+-        handle_ioreq(req);
++        handle_ioreq(state, req);
+ 
+         if (req->state != STATE_IOREQ_INPROCESS) {
+             fprintf(stderr, "Badness in I/O request ... not in service?!: "
+@@ -938,6 +954,7 @@ static void xen_exit_notifier(Notifier *n, void *data)
+ 
+     xc_evtchn_close(state->xce_handle);
+     xs_daemon_close(state->xenstore);
++    free(state->domain_path);
+ }
+ 
+ int xen_init(void)
+@@ -972,6 +989,12 @@ int xen_hvm_init(void)
+         return -errno;
+     }
+ 
++    state->domain_path = xs_get_domain_path(state->xenstore, xen_domid);
++    if (state->domain_path == NULL) {
++	perror("xen: get domain path");
++	return -errno;
++    }
++
+     state->exit.notify = xen_exit_notifier;
+     qemu_add_exit_notifier(&state->exit);
+ 

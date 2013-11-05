@@ -1,0 +1,224 @@
+diff --git a/console.h b/console.h
+index fedfd76..6fa4fb6 100644
+--- a/console.h
++++ b/console.h
+@@ -217,7 +217,8 @@ struct DisplayState {
+     vga_hw_update_ptr hw_update;
+     vga_hw_invalidate_ptr hw_invalidate;
+     vga_hw_notify_ptr hw_notify;
+-
++    int (*hw_get_base_address)(void *opaque, void **vram_base, size_t *vram_size);
++ 
+     /* Opaque structure to pass to hw_callbacks. Filled in by hw. */
+     void *vga_state;
+     
+diff --git a/hw/vga-orc.c b/hw/vga-orc.c
+index 5e132de..df15bcb 100644
+--- a/hw/vga-orc.c
++++ b/hw/vga-orc.c
+@@ -677,6 +677,26 @@ static void orc_vga_set_orientation(DisplayState *ds, uint32_t x, uint32_t y, ui
+     }
+ }
+ 
++static int orc_vga_get_base_address(void *opaque, void **vram_base, size_t *vram_size)
++{
++    DisplayState *ds = opaque;
++    ORCVGAState *o = ds->vga_state;
++    VGACommonState *s = &o->vga;
++
++    if (!vram_base || !vram_size) {
++        return -EINVAL;
++    }
++
++    if (s->vram_ptr) {
++        *vram_base = s->vram_ptr;
++        *vram_size = vga_ram_size();
++    } else {
++        return -EAGAIN;
++    }
++
++    return 0;
++}
++
+ static DisplayState *orc_vga_add_ds(void *opaque)
+ {
+     ORCVGAState *o = opaque;
+@@ -692,6 +712,7 @@ static DisplayState *orc_vga_add_ds(void *opaque)
+     ds->hw_set_orientation = orc_vga_set_orientation;
+     ds->hw_store_edid = orc_vga_store_edid;
+     ds->hw_notify = orc_vga_notify;
++    ds->hw_get_base_address = orc_vga_get_base_address;
+     ds->vga_state = o;
+ 
+     o->num_displays++;
+@@ -718,6 +739,7 @@ static int orc_vga_initfn(PCIDevice *dev)
+     s->ds->hw_set_orientation = orc_vga_set_orientation;
+     s->ds->hw_store_edid = orc_vga_store_edid;
+     s->ds->hw_notify = orc_vga_notify;
++    s->ds->hw_get_base_address = orc_vga_get_base_address;
+ 
+     o->num_displays++;
+     
+diff --git a/ui/orc-ds.c b/ui/orc-ds.c
+index 18cb38e..b5ba7d9 100644
+--- a/ui/orc-ds.c
++++ b/ui/orc-ds.c
+@@ -102,7 +102,7 @@ static int orc_ds_map_shm(DisplayState *ds)
+ 
+         if (fs->attached) {
+             NxDetachDisplay(be_state.be, fs->server_display_id);
+-            fs->attached = FALSE;
++            fs->attached = DS_NOT_ATTACHED;
+         }
+ 
+         fs->shm_size = ds_get_height(ds) * ds_get_linesize(ds);
+@@ -138,7 +138,7 @@ static int orc_ds_map_shm(DisplayState *ds)
+                            fs->shm_size,
+                            fs->shm_id);
+ 
+-        fs->attached = TRUE;
++        fs->attached = DS_ATTACHED_SHM;
+ 
+         be_state.dirty_layout = TRUE;
+ 
+@@ -163,6 +163,8 @@ static int orc_ds_map_shm(DisplayState *ds)
+ static int orc_ds_map_foreign(DisplayState *ds)
+ {
+     OrcDsState *fs = (OrcDsState *)ds->opaque;
++    void *base;
++    size_t size;
+     int ret = 0;
+ 
+     if (fs->server_display_id < 0) {
+@@ -172,34 +174,61 @@ static int orc_ds_map_foreign(DisplayState *ds)
+     /* Clean-up any old shm handle that we might have left around */
+     cleanup_shm(fs);
+ 
+-    if (fs->attached) {
++    if (fs->attached == DS_ATTACHED_SHM) {
+         NxDetachDisplay(be_state.be, fs->server_display_id);
+-        fs->attached = FALSE;
+-    }
+-
+-    fs->shm_size = ds_get_height(ds) * ds_get_linesize(ds);
+-
+-    qemu_log("AttachGuestDisplay( id = %d, x = %d, y = %d, "
+-             "w = %d, h = %d, bpp = %d, size = %zx, did = %d, addr = %p)",
+-             fs->server_display_id, fs->x_origin, fs->y_origin,
+-             ds_get_width(ds), ds_get_height(ds),
+-             ds_get_bits_per_pixel(ds), fs->shm_size,
+-             xen_domid, (void *)qemu_ram_addr_from_host_nofail(ds_get_data(ds)));
+-
+-    NxAttachGuestDisplay(be_state.be,
+-                         fs->server_display_id,
+-                         fs->x_origin,
+-                         fs->y_origin,
+-                         ds_get_width(ds),
+-                         ds_get_height(ds),
+-                         ds_get_bits_per_pixel(ds),
+-                         fs->shm_size,
+-                         xen_domid,
+-                         qemu_ram_addr_from_host_nofail(ds_get_data(ds)));
+-    fs->attached = TRUE;
+-    be_state.dirty_layout = TRUE;
++        fs->attached = DS_NOT_ATTACHED;
++    }
++
++    if (ds->hw_get_base_address == NULL ||
++        ds->hw_get_base_address(ds, &base, &size) < 0) {
++        base = ds_get_data(ds);
++        size = ds_get_height(ds) * ds_get_linesize(ds);
++    }
++
++    if (fs->attached == DS_ATTACHED_FOREIGN &&
++        (fs->foreign_base != base ||
++         fs->foreign_size != size)) {
++        NxDetachDisplay(be_state.be, fs->server_display_id);
++        fs->attached = DS_NOT_ATTACHED;
++    }
+ 
+-    ret = 1;
++    if (!fs->attached) {
++        unsigned bpp, width, stride;
++
++        bpp    = ds_get_bits_per_pixel(ds);
++        width  = ds_get_width(ds);
++        stride = width * ((bpp + 7) >> 3);
++
++        fs->foreign_base = base;
++        fs->foreign_size = size;
++    
++        qemu_log("AttachGuestDisplay( id = %d, x = %d, y = %d, "
++                 "w = %d, h = %d, bpp = %d, size = %zx, did = %d, addr = %p)",
++                 fs->server_display_id, fs->x_origin, fs->y_origin,
++                 ds_get_width(ds), ds_get_height(ds),
++                 ds_get_bits_per_pixel(ds), fs->foreign_size,
++                 xen_domid, (void *)qemu_ram_addr_from_host_nofail(ds_get_data(ds)));
++
++        NxAttachVRAM(be_state.be, fs->foreign_size, xen_domid,
++                     qemu_ram_addr_from_host_nofail(fs->foreign_base));
++        fs->attached = DS_ATTACHED_FOREIGN;
++        be_state.dirty_layout = TRUE;
++
++        NxDefineFramebuffer(be_state.be,
++                            fs->server_display_id,
++                            fs->x_origin,
++                            fs->y_origin,
++                            ds_get_width(ds),
++                            ds_get_height(ds),
++                            ds_get_bits_per_pixel(ds),
++                            stride,
++                            (void *)ds_get_data(ds) - (void *)fs->foreign_base);
++        ret = 1;
++    } 
++        
++    NxSetFramebufferOffset(be_state.be,
++                           fs->server_display_id,
++                           (void *)ds_get_data(ds) - (void *)fs->foreign_base);
+ 
+     return ret;
+ }
+@@ -271,7 +300,7 @@ do_remove_display(DisplayState *ds)
+ 
+     be_state.dirty_layout = TRUE;
+ 
+-    fs->attached = FALSE;
++    fs->attached = DS_NOT_ATTACHED;
+ }
+ 
+ static int orc_ds_error_cb(NxBackend *be, void *closure, void *data)
+@@ -903,7 +932,8 @@ static struct DisplayChangeListener orc_dcl = {
+     .dpy_cursor_enable = orc_ds_cursor_enable,
+     .dpy_lock = orc_ds_lock,
+     .dpy_unlock = orc_ds_unlock,
+-    .next = NULL
++    .next.le_next = NULL,
++    .next.le_prev = NULL,
+ };
+ 
+ /* Initialization function
+diff --git a/ui/orc-ds.h b/ui/orc-ds.h
+index eb23fd3..1f7e13d 100644
+--- a/ui/orc-ds.h
++++ b/ui/orc-ds.h
+@@ -35,7 +35,9 @@ typedef struct OrcDsState_t {
+     int32_t guest_id;
+     int32_t server_display_id;
+ 
+-    bool    attached;
++    enum    { DS_NOT_ATTACHED = 0,
++              DS_ATTACHED_SHM,
++              DS_ATTACHED_FOREIGN } attached;
+ 
+     Region  update_region;  /* Rectangle queue */
+     uint8_t visible;
+@@ -45,6 +47,9 @@ typedef struct OrcDsState_t {
+     size_t  shm_size;
+     int     shm_id;
+ 
++    void   *foreign_base;
++    size_t  foreign_size;
++
+     int     x_origin;
+     int     y_origin;
+ 

@@ -1,0 +1,13 @@
+diff --git a/hw/vga.c b/hw/vga.c
+index 26fc832..0569b7c 100644
+--- a/hw/vga.c
++++ b/hw/vga.c
+@@ -639,7 +639,7 @@ static void vbe_ioport_write_data(void *opaque, uint32_t addr, uint32_t val)
+             }
+             break;
+         case VBE_DISPI_INDEX_XRES:
+-            if ((val <= vs.max_xres) && ((val & 7) == 0)) {
++            if (val <= vs.max_xres) {
+                 s->vbe_regs[s->vbe_index] = val;
+             }
+             break;

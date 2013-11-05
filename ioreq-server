@@ -1,0 +1,553 @@
+diff --git a/hw/pc_piix.c b/hw/pc_piix.c
+index bf4152a..54c7e4e 100644
+--- a/hw/pc_piix.c
++++ b/hw/pc_piix.c
+@@ -353,9 +353,11 @@ static void pc_xen_hvm_init(ram_addr_t ram_size,
+     if (xen_hvm_init() != 0) {
+         hw_error("xen hardware virtual machine initialisation failed");
+     }
++    xen_register_default_dev = 1;
+     pc_init_pci_no_kvmclock(ram_size, boot_device,
+                             kernel_filename, kernel_cmdline,
+                             initrd_filename, cpu_model);
++    xen_register_default_dev = 0;
+     xen_vcpu_init();
+ }
+ #endif
+diff --git a/hw/pci.c b/hw/pci.c
+index 3b39d59..8efa798 100644
+--- a/hw/pci.c
++++ b/hw/pci.c
+@@ -31,6 +31,7 @@
+ #include "loader.h"
+ #include "range.h"
+ #include "qmp-commands.h"
++#include "xen.h"
+ 
+ //#define DEBUG_PCI
+ #ifdef DEBUG_PCI
+@@ -764,6 +765,11 @@ static PCIDevice *do_pci_register_device(PCIDevice *pci_dev, PCIBus *bus,
+     pci_dev->devfn = devfn;
+     pstrcpy(pci_dev->name, sizeof(pci_dev->name), name);
+     pci_dev->irq_state = 0;
++
++    if (xen_enabled() && xen_register_pcidev(pci_dev)) {
++        return NULL;
++    }
++
+     pci_config_alloc(pci_dev);
+ 
+     pci_config_set_vendor_id(pci_dev->config, pc->vendor_id);
+diff --git a/hw/xen.h b/hw/xen.h
+index 50a4580..69c4a5a 100644
+--- a/hw/xen.h
++++ b/hw/xen.h
+@@ -21,6 +21,7 @@ extern uint32_t xen_domid;
+ extern enum xen_mode xen_mode;
+ 
+ extern int xen_allowed;
++extern int xen_register_default_dev;
+ 
+ static inline int xen_enabled(void)
+ {
+@@ -35,6 +36,7 @@ int xen_pci_slot_get_pirq(PCIDevice *pci_dev, int irq_num);
+ void xen_piix3_set_irq(void *opaque, int irq_num, int level);
+ void xen_piix_pci_write_config_client(uint32_t address, uint32_t val, int len);
+ void xen_hvm_inject_msi(uint64_t addr, uint32_t data);
++int xen_register_pcidev(PCIDevice *pci_dev);
+ void xen_cmos_set_s3_resume(void *opaque, int irq, int level);
+ 
+ qemu_irq *xen_interrupt_controller_init(void);
+diff --git a/hw/xen_common.h b/hw/xen_common.h
+index 2f7ff28..1119e08 100644
+--- a/hw/xen_common.h
++++ b/hw/xen_common.h
+@@ -148,6 +148,35 @@ static inline int xen_xc_hvm_inject_msi(XenXC xen_xc, domid_t dom,
+ }
+ #endif
+ 
++/* We assume that Xen support multiple ioreq server */
++static inline int xen_xc_hvm_register_pcidev(XenXC xen_xc, domid_t dom,
++        unsigned int serverid, uint8_t domain, uint8_t bus,
++        uint8_t device, uint8_t function)
++{
++    return xc_hvm_register_pcidev(xen_xc, dom, serverid,
++                                  domain, bus, device, function);
++}
++
++static inline int xen_xc_hvm_map_io_range_to_ioreq_server(XenXC xen_xc,
++        domid_t dom, unsigned int serverid, int is_mmio,
++        uint64_t start, uint64_t end)
++{
++    return xc_hvm_map_io_range_to_ioreq_server(xen_xc, dom, serverid, is_mmio,
++                                               start, end);
++}
++
++static inline int xen_xc_hvm_unmap_io_range_from_ioreq_server(XenXC xen_xc,
++        domid_t dom, unsigned int serverid, int is_mmio, uint64_t start)
++{
++    return xc_hvm_unmap_io_range_from_ioreq_server(xen_xc, dom, serverid,
++                                                   is_mmio, start);
++}
++
++static inline int xen_xc_hvm_register_ioreq_server(XenXC xen_xc, domid_t dom)
++{
++    return xc_hvm_register_ioreq_server(xen_xc, dom);
++}
++
+ void destroy_hvm_domain(bool reboot);
+ 
+ #endif /* QEMU_HW_XEN_COMMON_H */
+diff --git a/ioport.c b/ioport.c
+index 6e4ca0d..1a70298 100644
+--- a/ioport.c
++++ b/ioport.c
+@@ -28,6 +28,7 @@
+ #include "ioport.h"
+ #include "trace.h"
+ #include "memory.h"
++#include "hw/xen.h"
+ 
+ /***********************************************************/
+ /* IO Port */
+@@ -155,6 +156,7 @@ int register_ioport_read(pio_addr_t start, int length, int size,
+                      i);
+         ioport_opaque[i] = opaque;
+     }
++
+     return 0;
+ }
+ 
+@@ -175,7 +177,9 @@ int register_ioport_write(pio_addr_t start, int length, int size,
+                      i);
+         ioport_opaque[i] = opaque;
+     }
++
+     return 0;
++
+ }
+ 
+ static uint32_t ioport_readb_thunk(void *opaque, uint32_t addr)
+@@ -260,6 +264,7 @@ void isa_unassign_ioport(pio_addr_t start, int length)
+         ioport_destructor_table[start](ioport_opaque[start]);
+         ioport_destructor_table[start] = NULL;
+     }
++
+     for(i = start; i < start + length; i++) {
+         ioport_read_table[0][i] = NULL;
+         ioport_read_table[1][i] = NULL;
+diff --git a/qemu-config.c b/qemu-config.c
+index be84a03..35f1ef0 100644
+--- a/qemu-config.c
++++ b/qemu-config.c
+@@ -582,6 +582,14 @@ static QemuOptsList qemu_machine_opts = {
+             .name = "dtb",
+             .type = QEMU_OPT_STRING,
+             .help = "Linux kernel device tree file",
++        }, {
++            .name = "xen_dmid",
++            .type = QEMU_OPT_NUMBER,
++            .help = "Xen device model id",
++        }, {
++            .name = "xen_default_dev",
++            .type = QEMU_OPT_BOOL,
++            .help = "emulate Xen default device (South Bridge, IDE, ...)"
+         },
+         { /* End of list */ }
+     },
+diff --git a/xen-all.c b/xen-all.c
+index 0e4726f..3fde6b4 100644
+--- a/xen-all.c
++++ b/xen-all.c
+@@ -37,6 +37,12 @@
+ #endif
+ 
+ static MemoryRegion ram_memory, ram_640k, ram_lo, ram_hi;
++static unsigned int serverid;
++static uint32_t xen_dmid = ~0;
++
++/* Use to tell if we register pci/mmio/pio of default devices */
++int xen_register_default_dev = 0;
++static int xen_emulate_default_dev = 0;
+ 
+ #define USE_DIRTY_PAGE_TRACKING
+ 
+@@ -66,6 +72,31 @@ static inline ioreq_t *xen_vcpu_ioreq(shared_iopage_t *shared_page, int vcpu)
+ #define HVM_PARAM_BUFIOREQ_EVTCHN 26
+ #endif
+ 
++static inline unsigned long xen_buffered_iopage(void)
++{
++    unsigned long pfn;
++
++    xc_get_hvm_param(xen_xc, xen_domid, HVM_PARAM_IO_PFN_FIRST, &pfn);
++    pfn += (serverid - 1) * 2 + 2;
++
++    return pfn;
++}
++
++static inline unsigned long xen_iopage(void)
++{
++    unsigned long pfn;
++
++    xc_get_hvm_param(xen_xc, xen_domid, HVM_PARAM_IO_PFN_FIRST, &pfn);
++    pfn += (serverid - 1) * 2 + 1;
++
++    return pfn;
++}
++
++static inline evtchn_port_or_error_t xen_buffered_channel(void)
++{
++    return xc_hvm_get_ioreq_server_buf_channel(xen_xc, xen_domid, serverid);
++}
++
+ #define BUFFER_IO_MAX_DELAY  100
+ 
+ typedef struct XenPhysmap {
+@@ -92,6 +123,7 @@ typedef struct XenIOState {
+ 
+     struct xs_handle *xenstore;
+     MemoryListener memory_listener;
++    MemoryListener io_listener;
+     QLIST_HEAD(, XenPhysmap) physmap;
+     target_phys_addr_t free_phys_offset;
+     const XenPhysmap *log_for_dirtybit;
+@@ -114,6 +146,17 @@ void xen_piix3_set_irq(void *opaque, int irq_num, int level)
+                               irq_num & 3, level);
+ }
+ 
++int xen_register_pcidev(PCIDevice *pci_dev)
++{
++    if (xen_register_default_dev && !xen_emulate_default_dev) {
++        return 0;
++    }
++
++    return xen_xc_hvm_register_pcidev(xen_xc, xen_domid, serverid,
++                                      0, 0, (pci_dev->devfn >> 3) & 0x1f,
++                                      (pci_dev->devfn & 0x7));
++}
++
+ void xen_piix_pci_write_config_client(uint32_t address, uint32_t val, int len)
+ {
+     int i;
+@@ -136,6 +179,35 @@ void xen_hvm_inject_msi(uint64_t addr, uint32_t data)
+     xen_xc_hvm_inject_msi(xen_xc, xen_domid, addr, data);
+ }
+ 
++static void xen_map_iorange(target_phys_addr_t addr, uint64_t size,
++                            int is_mmio, const char *name)
++{
++    /* Don't register xen.ram */
++    if (is_mmio && !strncmp(name, "xen.ram", 7)) {
++        return;
++    }
++
++    /* Handle the registration of all default io range */
++    if (xen_register_default_dev && !xen_emulate_default_dev) {
++        return;
++    }
++
++    if (!is_mmio)
++        printf("map io %s 0x%llx - 0x%llx\n", name, addr, addr + size - 1);
++    else
++        printf("map mmio %s 0x%llx - 0x%llx\n", name, addr, addr + size - 1);
++
++    xen_xc_hvm_map_io_range_to_ioreq_server(xen_xc, xen_domid, serverid,
++                                            is_mmio, addr, addr + size - 1);
++}
++
++static void xen_unmap_iorange(target_phys_addr_t addr, uint64_t size,
++                              int is_mmio)
++{
++    xen_xc_hvm_unmap_io_range_from_ioreq_server(xen_xc, xen_domid, serverid,
++                                                is_mmio, addr);
++}
++
+ static void xen_suspend_notifier(Notifier *notifier, void *data)
+ {
+     xc_set_hvm_param(xen_xc, xen_domid, HVM_PARAM_ACPI_S_STATE, 3);
+@@ -524,13 +596,18 @@ static void xen_commit(MemoryListener *listener)
+ static void xen_region_add(MemoryListener *listener,
+                            MemoryRegionSection *section)
+ {
+-//    xen_set_memory(listener, section, true);
++    xen_set_memory(listener, section, true);
++    xen_map_iorange(section->offset_within_address_space,
++                    section->size, 1, section->mr->name);
++
+ }
+ 
+ static void xen_region_del(MemoryListener *listener,
+                            MemoryRegionSection *section)
+ {
+-//    xen_set_memory(listener, section, false);
++    xen_set_memory(listener, section, false);
++    xen_unmap_iorange(section->offset_within_address_space,
++                      section->size, 1);
+ }
+ 
+ static void xen_region_nop(MemoryListener *listener,
+@@ -632,6 +709,84 @@ static MemoryListener xen_memory_listener = {
+     .priority = 10,
+ };
+ 
++static void xen_io_begin(MemoryListener *listener)
++{
++}
++
++static void xen_io_commit(MemoryListener *listener)
++{
++}
++
++static void xen_io_region_add(MemoryListener *listener,
++                              MemoryRegionSection *section)
++{
++    xen_map_iorange(section->offset_within_address_space,
++                    section->size, 0, section->mr->name);
++}
++
++static void xen_io_region_del(MemoryListener *listener,
++                              MemoryRegionSection *section)
++{
++    xen_unmap_iorange(section->offset_within_address_space,
++                      section->size, 0);
++}
++
++static void xen_io_region_nop(MemoryListener *listener,
++                              MemoryRegionSection *section)
++{
++}
++
++static void xen_io_log_start(MemoryListener *listener,
++                             MemoryRegionSection *section)
++{
++}
++
++static void xen_io_log_stop(MemoryListener *listener,
++                            MemoryRegionSection *section)
++{
++}
++
++static void xen_io_log_sync(MemoryListener *listener,
++                            MemoryRegionSection *section)
++{
++}
++
++static void xen_io_log_global_start(MemoryListener *listener)
++{
++}
++
++static void xen_io_log_global_stop(MemoryListener *listener)
++{
++}
++
++static void xen_io_eventfd_add(MemoryListener *listener,
++                               MemoryRegionSection *section,
++                               bool match_data, uint64_t data, int fd)
++{
++}
++
++static void xen_io_eventfd_del(MemoryListener *listener,
++                               MemoryRegionSection *section,
++                               bool match_data, uint64_t data, int fd)
++{
++}
++
++static MemoryListener xen_io_listener = {
++    .begin = xen_io_begin,
++    .commit = xen_io_commit,
++    .region_add = xen_io_region_add,
++    .region_del = xen_io_region_del,
++    .region_nop = xen_io_region_nop,
++    .log_start = xen_io_log_start,
++    .log_stop = xen_io_log_stop,
++    .log_sync = xen_io_log_sync,
++    .log_global_start = xen_io_log_global_start,
++    .log_global_stop = xen_io_log_global_stop,
++    .eventfd_add = xen_io_eventfd_add,
++    .eventfd_del = xen_io_eventfd_del,
++    .priority = 10,
++};
++
+ /* VCPU Operations, MMIO, IO ring ... */
+ 
+ static void xen_reset_vcpu(void *opaque)
+@@ -828,6 +983,17 @@ static void cpu_ioreq_timeoffset(XenIOState *state, ioreq_t *req)
+ 	qemu_log("Error writing RTC timeoffset %s to xenstore", b);
+ }
+ 
++static void cpu_ioreq_config_space(ioreq_t *req)
++{
++    uint64_t addr = req->addr;
++    uint64_t cf8 = req->addr & (~0x3);
++
++    req->addr = 0xcfc + (addr & 0x3);
++    do_outp(0xcf8, 4, cf8);
++    cpu_ioreq_pio(req);
++    req->addr = addr;
++}
++
+ static void handle_ioreq(XenIOState *state, ioreq_t *req)
+ {
+     if (!req->data_is_ptr && (req->dir == IOREQ_WRITE) &&
+@@ -847,6 +1013,9 @@ static void handle_ioreq(XenIOState *state, ioreq_t *req)
+             break;
+         case IOREQ_TYPE_INVALIDATE:
+             break;
++        case IOREQ_TYPE_PCI_CONFIG:
++            cpu_ioreq_config_space(req);
++            break;
+         default:
+             hw_error("Invalid ioreq type 0x%x\n", req->type);
+     }
+@@ -1009,6 +1178,7 @@ void xenstore_store_pv_console_info(int i, CharDriverState *chr)
+ 
+ static void xenstore_record_dm_state(struct xs_handle *xs, const char *state)
+ {
++    char *dompath;
+     char path[50];
+ 
+     if (xs == NULL) {
+@@ -1016,11 +1186,24 @@ static void xenstore_record_dm_state(struct xs_handle *xs, const char *state)
+         exit(1);
+     }
+ 
+-    snprintf(path, sizeof (path), "/local/domain/0/device-model/%u/state", xen_domid);
++    if (!(dompath = xs_get_domain_path(xs, xen_domid)))
++        hw_error ("Unable to retrieve domain path\n");
++
++
++    if (xen_dmid == ~0) {
++        snprintf(path, sizeof (path), "/local/domain/0/device-model/%u/state",
++                 xen_domid);
++    } else {
++        /* Don't use the same path for xenclient */
++        snprintf(path, sizeof (path), "%s/dms/%u/state", dompath, xen_dmid);
++    }
++
+     if (!xs_write(xs, XBT_NULL, path, state, strlen(state))) {
+         fprintf(stderr, "error recording dm state\n");
+         exit(1);
+     }
++
++    free(dompath);
+ }
+ 
+ static void xen_main_loop_prepare(XenIOState *state)
+@@ -1135,6 +1318,19 @@ int xen_hvm_init(void)
+     unsigned long ioreq_pfn;
+     unsigned long bufioreq_evtchn;
+     XenIOState *state;
++    QemuOptsList *list = qemu_find_opts("machine");
++
++    if (!QTAILQ_EMPTY(&list->head)) {
++        xen_dmid = qemu_opt_get_number(QTAILQ_FIRST(&list->head),
++                                       "xen_dmid", ~0);
++        xen_emulate_default_dev = qemu_opt_get_bool(QTAILQ_FIRST(&list->head),
++                                                    "xen_default_dev", 0);
++    }
++
++   if (xen_dmid == ~0) {
++        xen_emulate_default_dev = 1;
++   }
++
+ 
+     state = g_malloc0(sizeof (XenIOState));
+ 
+@@ -1162,7 +1358,14 @@ int xen_hvm_init(void)
+     state->suspend.notify = xen_suspend_notifier;
+     qemu_register_suspend_notifier(&state->suspend);
+ 
+-    xc_get_hvm_param(xen_xc, xen_domid, HVM_PARAM_IOREQ_PFN, &ioreq_pfn);
++    rc = xen_xc_hvm_register_ioreq_server(xen_xc, xen_domid);
++
++    if (rc < 0)
++        hw_error("registered server returned error %d", rc);
++
++    serverid = rc;
++
++    ioreq_pfn = xen_iopage();
+     DPRINTF("shared page at pfn %lx\n", ioreq_pfn);
+     state->shared_page = xc_map_foreign_range(xen_xc, xen_domid, XC_PAGE_SIZE,
+                                               PROT_READ|PROT_WRITE, ioreq_pfn);
+@@ -1171,7 +1374,7 @@ int xen_hvm_init(void)
+                  errno, xen_xc);
+     }
+ 
+-    xc_get_hvm_param(xen_xc, xen_domid, HVM_PARAM_BUFIOREQ_PFN, &ioreq_pfn);
++    ioreq_pfn = xen_buffered_iopage();
+     DPRINTF("buffered io page at pfn %lx\n", ioreq_pfn);
+     state->buffered_io_page = xc_map_foreign_range(xen_xc, xen_domid, XC_PAGE_SIZE,
+                                                    PROT_READ|PROT_WRITE, ioreq_pfn);
+@@ -1192,12 +1395,14 @@ int xen_hvm_init(void)
+         state->ioreq_local_port[i] = rc;
+     }
+ 
+-    rc = xc_get_hvm_param(xen_xc, xen_domid, HVM_PARAM_BUFIOREQ_EVTCHN,
+-            &bufioreq_evtchn);
++    rc = xen_buffered_channel();
+     if (rc < 0) {
+         fprintf(stderr, "failed to get HVM_PARAM_BUFIOREQ_EVTCHN\n");
+         return -1;
+     }
++
++    bufioreq_evtchn = rc;
++
+     rc = xc_evtchn_bind_interdomain(state->xce_handle, xen_domid,
+             (uint32_t)bufioreq_evtchn);
+     if (rc == -1) {
+@@ -1216,6 +1421,9 @@ int xen_hvm_init(void)
+     memory_listener_register(&state->memory_listener, get_system_memory());
+     state->log_for_dirtybit = NULL;
+ 
++    state->io_listener = xen_io_listener;
++    memory_listener_register(&state->io_listener, get_system_io());
++
+     /* Initialize backend core & drivers */
+     if (xen_be_init() != 0) {
+         fprintf(stderr, "%s: xen backend core setup failed\n", __FUNCTION__);
+diff --git a/xen-mapcache.c b/xen-mapcache.c
+index fc04b19..b86142a 100644
+--- a/xen-mapcache.c
++++ b/xen-mapcache.c
+@@ -392,6 +392,9 @@ void xen_invalidate_map_cache(void)
+             continue;
+         }
+ 
++	if (entry->lock > 0)
++	    continue;
++
+         if (munmap(entry->vaddr_base, entry->size) != 0) {
+             perror("unmap fails");
+             exit(-1);
+diff --git a/xen-stub.c b/xen-stub.c
+index 108cfdd..23796a1 100644
+--- a/xen-stub.c
++++ b/xen-stub.c
+@@ -25,6 +25,11 @@ void xen_piix3_set_irq(void *opaque, int irq_num, int level)
+ {
+ }
+ 
++int xen_register_pcidev(PCIDevice *pci_dev)
++{
++    return 1;
++}
++
+ void xen_piix_pci_write_config_client(uint32_t address, uint32_t val, int len)
+ {
+ }
+@@ -33,6 +38,14 @@ void xen_hvm_inject_msi(uint64_t addr, uint32_t data)
+ {
+ }
+ 
++void xen_map_iorange(uint64_t addr, uint64_t size, int is_mmio)
++{
++}
++
++void xen_unmap_iorange(uint64_t addr, uint64_t size, int is_mmio)
++{
++}
++
+ void xen_cmos_set_s3_resume(void *opaque, int irq, int level)
+ {
+ }

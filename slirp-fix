@@ -1,0 +1,14 @@
+diff --git a/main-loop.c b/main-loop.c
+index 1c0f9bb..8fa3519 100644
+--- a/main-loop.c
++++ b/main-loop.c
+@@ -24,7 +24,9 @@
+ 
+ #include "qemu-common.h"
+ #include "qemu-timer.h"
++#ifdef CONFIG_SLIRP
+ #include "slirp/slirp.h"
++#endif
+ #include "main-loop.h"
+ #include "orc_rpc.h"
+ 

@@ -1,0 +1,127 @@
+diff --git a/console.c b/console.c
+index 048b48e..5494439 100644
+--- a/console.c
++++ b/console.c
+@@ -34,6 +34,8 @@
+ #define QEMU_RGBA(r, g, b, a) (((a) << 24) | ((r) << 16) | ((g) << 8) | (b))
+ #define QEMU_RGB(r, g, b) QEMU_RGBA(r, g, b, 0xff)
+ 
++pthread_mutex_t cursor_mutex;
++
+ typedef struct TextAttributes {
+     uint8_t fgcol:4;
+     uint8_t bgcol:4;
+@@ -1380,6 +1382,8 @@ static void dumb_display_init(void)
+     }
+     ds->surface = qemu_create_displaysurface(ds, width, height);
+     register_displaystate(ds);
++
++    pthread_mutex_init(&cursor_mutex, NULL);
+ }
+ 
+ /***********************************************************/
+diff --git a/console.h b/console.h
+index d5b6bf3..c425eea 100644
+--- a/console.h
++++ b/console.h
+@@ -148,6 +148,8 @@ void cursor_set_mono(QEMUCursor *c,
+ void cursor_get_mono_image(QEMUCursor *c, int foreground, uint8_t *mask);
+ void cursor_get_mono_mask(QEMUCursor *c, int transparent, uint8_t *mask);
+ 
++extern pthread_mutex_t cursor_mutex;
++
+ struct DisplayChangeListener {
+     int idle;
+     uint64_t gui_timer_interval;
+diff --git a/cursor.c b/cursor.c
+index 76e262c..f95e4d8 100644
+--- a/cursor.c
++++ b/cursor.c
+@@ -64,7 +64,10 @@ void cursor_print_ascii_art(QEMUCursor *c, const char *prefix)
+     for (y = 0; y < c->height; y++) {
+         fprintf(stderr, "%s: %2d: |", prefix, y);
+         for (x = 0; x < c->width; x++, data++) {
+-            if ((*data & 0xff000000) != 0xff000000) {
++            if (x == c->hot_x &&
++		y == c->hot_y) {
++                fprintf(stderr, "O");
++            } else if ((*data & 0xff000000) != 0xff000000) {
+                 fprintf(stderr, " "); /* transparent */
+             } else if ((*data & 0x00ffffff) == 0x00ffffff) {
+                 fprintf(stderr, "."); /* white */
+@@ -108,17 +111,21 @@ QEMUCursor *cursor_alloc(int width, int height)
+ 
+ void cursor_get(QEMUCursor *c)
+ {
++    pthread_mutex_lock(&cursor_mutex);
+     c->refcount++;
++    pthread_mutex_unlock(&cursor_mutex);
+ }
+ 
+ void cursor_put(QEMUCursor *c)
+ {
+     if (c == NULL)
+         return;
++
++    pthread_mutex_lock(&cursor_mutex);
+     c->refcount--;
+-    if (c->refcount)
+-        return;
+-    g_free(c);
++    if (c->refcount == 0)
++        g_free(c);
++    pthread_mutex_unlock(&cursor_mutex);
+ }
+ 
+ int cursor_get_mono_bpl(QEMUCursor *c)
+@@ -134,6 +141,8 @@ void cursor_set_mono(QEMUCursor *c,
+     uint8_t bit;
+     int x,y,bpl;
+ 
++    pthread_mutex_lock(&cursor_mutex);
++
+     bpl = cursor_get_mono_bpl(c);
+     for (y = 0; y < c->height; y++) {
+         bit = 0x80;
+@@ -155,6 +164,8 @@ void cursor_set_mono(QEMUCursor *c,
+         mask  += bpl;
+         image += bpl;
+     }
++
++    pthread_mutex_unlock(&cursor_mutex);
+ }
+ 
+ void cursor_get_mono_image(QEMUCursor *c, int foreground, uint8_t *image)
+@@ -163,6 +174,8 @@ void cursor_get_mono_image(QEMUCursor *c, int foreground, uint8_t *image)
+     uint8_t bit;
+     int x,y,bpl;
+ 
++    pthread_mutex_lock(&cursor_mutex);
++
+     bpl = cursor_get_mono_bpl(c);
+     memset(image, 0, bpl * c->height);
+     for (y = 0; y < c->height; y++) {
+@@ -179,6 +192,8 @@ void cursor_get_mono_image(QEMUCursor *c, int foreground, uint8_t *image)
+         }
+         image += bpl;
+     }
++
++    pthread_mutex_unlock(&cursor_mutex);
+ }
+ 
+ void cursor_get_mono_mask(QEMUCursor *c, int transparent, uint8_t *mask)
+@@ -187,6 +202,8 @@ void cursor_get_mono_mask(QEMUCursor *c, int transparent, uint8_t *mask)
+     uint8_t bit;
+     int x,y,bpl;
+ 
++    pthread_mutex_lock(&cursor_mutex);
++
+     bpl = cursor_get_mono_bpl(c);
+     memset(mask, 0, bpl * c->height);
+     for (y = 0; y < c->height; y++) {
+@@ -208,4 +225,5 @@ void cursor_get_mono_mask(QEMUCursor *c, int transparent, uint8_t *mask)
+         }
+         mask += bpl;
+     }
++    pthread_mutex_unlock(&cursor_mutex);
+ }

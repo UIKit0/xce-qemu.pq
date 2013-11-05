@@ -1,0 +1,37 @@
+diff --git a/configure b/configure
+index dceab2f..6696381 100755
+--- a/configure
++++ b/configure
+@@ -223,6 +223,7 @@ libiscsi=""
+ coroutine=""
+ seccomp=""
+ glusterfs=""
++open_by_handle="yes"
+ 
+ # parse CC options first
+ for opt do
+@@ -871,6 +872,8 @@ for opt do
+   ;;
+   --enable-glusterfs) glusterfs="yes"
+   ;;
++  --disable-open-by-handle) open_by_handle="no"
++  ;;
+   *) echo "ERROR: unknown option $opt"; show_help="yes"
+   ;;
+   esac
+@@ -2990,6 +2993,7 @@ fi
+ # check if we have open_by_handle_at
+ 
+ open_by_handle_at=no
++if test "$open_by_handle" != "no"; then
+ cat > $TMPC << EOF
+ #include <fcntl.h>
+ #if !defined(AT_EMPTY_PATH)
+@@ -3001,6 +3005,7 @@ EOF
+ if compile_prog "" "" ; then
+     open_by_handle_at=yes
+ fi
++fi
+ 
+ ########################################
+ # check if we have linux/magic.h
